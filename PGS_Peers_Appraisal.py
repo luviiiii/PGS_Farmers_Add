@@ -197,13 +197,14 @@ def _label_xpath(text: str) -> str:
 
 
 class Runner:
-    def __init__(self, cfg: Config, emit, stop_event, login_event, pause_event=None, close_event=None):
+    def __init__(self, cfg: Config, emit, stop_event, login_event, pause_event=None, close_event=None, cmd_q=None):
         self.cfg = cfg
         self.emit = emit
         self.stop = stop_event
         self.login_event = login_event
         self.pause = pause_event            # set = paused (takes effect between farmers)
         self.close_event = close_event      # set = close the browser when the farmers are done
+        self.cmd_q = cmd_q                  # jobs for the compliance page: ("compliance", {...}) / ("status_options",)
         self.dialog_msgs = []
         self.rows = []
         self.csv_path = None
@@ -459,11 +460,191 @@ class Runner:
                 return ("Added", shown, area, yld, own, "")
         return ("Failed", shown, area, yld, own, "pressing ADD had no visible effect (nothing was added)")
 
-    async def wait_for_ready(self):
+    # -- compliance page (after Save & Next) --
+    async def find_page_with(self, context, js_test):
+        for page in reversed(context.pages):
+            if page.is_closed():
+                continue
+            try:
+                if await page.evaluate(js_test):
+                    return page
+            except Exception:
+                continue
+        return None
+
+    async def process_commands(self, context):
+        if self.cmd_q is None:
+            return
+        while True:
+            try:
+                cmd = self.cmd_q.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if cmd[0] == "compliance":
+                    await self.do_compliance(context, cmd[1])
+                elif cmd[0] == "status_options":
+                    await self.read_status_options(context)
+            except FatalError:
+                raise
+            except Exception as exc:
+                self.log("   FAILED: " + ((str(exc).strip().splitlines() or [repr(exc)])[0][:220]), "err")
+            finally:
+                self.emit(("cmd_done", cmd[0]))
+
+    _FIND_CLAUSES = "() => /standard clause/i.test(document.body.innerText)"
+    _FIND_MEMBERS = "() => /recommended status/i.test(document.body.innerText)"
+
+    _JS_RADIOS = r"""(wanted) => {
+        const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const all = [...document.querySelectorAll('input[type=radio]')];
+        const tables = [...document.querySelectorAll('table')].filter(t => /standard clause/i.test(t.innerText || ''));
+        tables.sort((a, b) => (a.textContent || '').length - (b.textContent || '').length);
+        const scope = tables[0] || null;
+        const labelOf = r => {
+            let t = '';
+            if (r.labels && r.labels.length) t = r.labels[0].innerText;
+            if (!norm(t) && r.closest('label')) t = r.closest('label').innerText;
+            if (!norm(t)) { let n = r.nextSibling; while (n && !norm(t)) { t = n.textContent; n = n.nextSibling; } }
+            if (!norm(t) && r.nextElementSibling) t = r.nextElementSibling.innerText;
+            t = norm(t);
+            if (!t) { const v = norm(r.value); if (['yes', 'y'].includes(v)) t = 'yes'; if (['no', 'n'].includes(v)) t = 'no'; }
+            return t;
+        };
+        const groups = new Map();
+        all.forEach((r, i) => {
+            if (scope && !scope.contains(r)) return;
+            const key = r.name || ('row' + (r.closest('tr') ? [...document.querySelectorAll('tr')].indexOf(r.closest('tr')) : i));
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push([i, labelOf(r)]);
+        });
+        const pick = [], bad = [];
+        groups.forEach((items, key) => {
+            const hit = items.find(x => x[1] === wanted);
+            if (hit) pick.push(hit[0]); else bad.push(key + ': ' + items.map(x => x[1] || '?').join('/'));
+        });
+        return {pick, bad, groups: groups.size, scoped: !!scope};
+    }"""
+
+    _JS_MEMBER_SELECTS = r"""() => {
+        const all = [...document.querySelectorAll('select')];
+        const tables = [...document.querySelectorAll('table')].filter(t => /recommended status/i.test(t.innerText || ''));
+        tables.sort((a, b) => (a.textContent || '').length - (b.textContent || '').length);
+        const scope = tables[0] || null;
+        const out = [];
+        all.forEach((s, i) => {
+            if (scope && !scope.contains(s)) return;
+            const tr = s.closest('tr');
+            let name = '';
+            if (tr) { const cells = [...tr.children].map(c => (c.innerText || '').trim()).filter(x => x); name = cells.length > 1 ? cells[1] : (cells[0] || ''); }
+            out.push({i, name, options: [...s.options].map(o => [o.value, (o.textContent || '').replace(/\s+/g, ' ').trim()])});
+        });
+        return {selects: out, scoped: !!scope};
+    }"""
+
+    @staticmethod
+    def _key(text):
+        return re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+
+    def _match_status(self, options, wanted):
+        k = self._key(wanted)
+        real = [(v, t) for v, t in options if not norm(t).startswith("--") and norm(t) not in ("", "select")]
+        for v, t in real:
+            if self._key(t) == k:
+                return v, t
+        cont = [(v, t) for v, t in real if k and k in self._key(t)]
+        return cont[0] if len(cont) == 1 else None
+
+    async def do_compliance(self, context, job):
+        answer = str(job.get("answer", "Yes")).strip().lower()
+        status = str(job.get("status", "")).strip()
+        self.log(f"=== Compliance page: answer \"{answer.title()}\" for every clause, recommended status "
+                 f"\"{status}\" for every member ===", "head")
+        page = await self.find_page_with(context, self._FIND_CLAUSES)
+        if page is None:
+            page = await self.find_page_with(context, self._FIND_MEMBERS)
+        if page is None:
+            tab = context.pages[-1] if context.pages else None
+            if tab is not None:
+                dump = await self.debug_dump(tab, "compliance_page_not_found")
+                self.log(f"   (page details saved in {dump})", "warn")
+            self.log("The compliance page was not found. In the browser, click Save & Next so the page with "
+                     "'Standard Clause' appears, then click this button again.", "err")
+            return
+        await page.bring_to_front()
+
+        # 1 - Yes/No for every clause
+        info = await page.evaluate(self._JS_RADIOS, answer)
+        radios = page.locator("input[type=radio]")
+        ok = 0
+        for i in info["pick"]:
+            r = radios.nth(i)
+            got = await r.evaluate("e => { if (!e.checked) e.click(); return e.checked; }")
+            ok += 1 if got else 0
+        if not info["scoped"]:
+            self.log("   (clause table not recognised - used every Yes/No group on the page)", "warn")
+        if info["groups"] == 0:
+            self.log("   No Yes/No clauses found on this page.", "warn")
+        else:
+            self.log(f"   Clauses answered {answer.title()}: {ok} of {info['groups']}", "ok" if ok == info["groups"] else "warn")
+        for b in info["bad"][:5]:
+            self.log(f"   could not answer: {b}", "warn")
+
+        # 2 - recommended status for every member
+        if not status:
+            self.log("   No recommended status chosen - members left as they are.", "warn")
+            return
+        data = await page.evaluate(self._JS_MEMBER_SELECTS)
+        selects = page.locator("select")
+        done = bad = 0
+        if not data["selects"]:
+            dump = await self.debug_dump(page, "members_table_not_found")
+            self.log(f"   The members table (Recommended Status) was not found. Details saved in {dump}", "err")
+            return
+        for item in data["selects"]:
+            name = item["name"] or f"row {item['i']}"
+            opt = self._match_status(item["options"], status)
+            if opt is None:
+                names = ", ".join(t for _, t in item["options"] if not norm(t).startswith("--")) or "none"
+                self.log(f"   {name}: option {status!r} not available (choices: {names})", "err")
+                bad += 1
+                continue
+            sel = selects.nth(item["i"])
+            await self.choose(sel, opt)
+            if norm(await self.selected_text(sel)) == norm(opt[1]):
+                done += 1
+            else:
+                self.log(f"   {name}: the portal did not keep the choice", "err")
+                bad += 1
+            await asyncio.sleep(0.2)
+        self.log(f"   Members set to \"{status}\": {done} of {len(data['selects'])}"
+                 + (f"   (problems: {bad})" if bad else ""), "ok" if not bad else "warn")
+        self.log("   Nothing was submitted - check the page, then click Submit yourself.", "head")
+
+    async def read_status_options(self, context):
+        page = await self.find_page_with(context, self._FIND_MEMBERS)
+        if page is None:
+            self.log("The members table was not found. Click Save & Next so the compliance page appears, then "
+                     "click \"Load options from page\" again.", "err")
+            return
+        data = await page.evaluate(self._JS_MEMBER_SELECTS)
+        names = []
+        for item in data["selects"]:
+            for _, t in item["options"]:
+                if t and not norm(t).startswith("--") and t not in names:
+                    names.append(t)
+        if not names:
+            self.log("No choices found in the Recommended Status boxes.", "err")
+            return
+        self.emit(("status_options", names))
+        self.log("Recommended Status choices on this page: " + ", ".join(names), "ok")
+
+    async def wait_for_ready(self, context):
         self.emit(("login",))
         while not self.login_event.is_set():
-            if self.stop.is_set():
+            if self.stop.is_set() or (self.close_event is not None and self.close_event.is_set()):
                 return False
+            await self.process_commands(context)
             await asyncio.sleep(0.3)
         self.login_event.clear()
         return True
@@ -493,8 +674,8 @@ class Runner:
 
                     page, f = None, {}
                     while page is None:
-                        if not await self.wait_for_ready():
-                            raise FatalError("Stopped before the farmers were added.")
+                        if not await self.wait_for_ready(context):
+                            return counts, True          # closed before adding anything
                         page, f = await self.find_form_page(context)
                         if page is None:
                             tab = context.pages[-1] if context.pages else main_page
@@ -575,7 +756,8 @@ class Runner:
                     self.emit(("added_all", counts, stopped, str(self.xlsx_path)))
                     while (not (self.close_event is not None and self.close_event.is_set())
                            and browser.is_connected() and any(not p.is_closed() for p in context.pages)):
-                        await asyncio.sleep(0.5)
+                        await self.process_commands(context)
+                        await asyncio.sleep(0.4)
                 finally:
                     try:
                         await browser.close()
@@ -1221,7 +1403,11 @@ class MainScreen(ctk.CTkFrame):
         self.pause_event = threading.Event()
         self.close_event = threading.Event()
         self.adding_done = False
+        self.cmd_q = queue.Queue()
 
+        self.comply = tk.StringVar(value="Yes")
+        self.status_text = tk.StringVar(value="PGS GREEN 2")
+        self.status_values = ["PGS GREEN 2"]
         self.category = tk.StringVar(value="CEREALS")
         self.crop = tk.StringVar(value="PADDY (DHAN)")
         defaults = [("2", "2", "6", "5"), ("1", "1", "3", "3"), ("", "", "", "")]
@@ -1286,25 +1472,38 @@ class MainScreen(ctk.CTkFrame):
         row = ctk.CTkFrame(b, fg_color="transparent")
         row.pack(fill="x", pady=(8, 0))
         checkbox(row, "Test mode: fill the first farmer but do NOT press ADD", self.test_mode).pack(side="left")
+        button(row, "Browse...", self._browse_out, width=100).pack(side="right")
+        entry(row, self.out_dir, width=250).pack(side="right", padx=(0, 10))
+        label(row, "Save results to:", 12, SOFT).pack(side="right", padx=(0, 10))
+
+        # 3 - compliance page
+        c3 = Card(self, 3, "Compliance page", "After you click Save & Next - the page with the Yes / No table")
+        c3.pack(fill="x", padx=24, pady=4)
+        b = c3.body
         row = ctk.CTkFrame(b, fg_color="transparent")
-        row.pack(fill="x", pady=(8, 0))
-        row.columnconfigure(1, weight=1)
-        label(row, "Save results to:", 12, SOFT).grid(row=0, column=0, padx=(0, 10))
-        entry(row, self.out_dir, width=300).grid(row=0, column=1, sticky="ew", padx=(0, 10))
-        button(row, "Browse...", self._browse_out, width=110).grid(row=0, column=2)
+        row.pack(fill="x")
+        label(row, "Do all members comply?", 12, SOFT).pack(side="left")
+        combo(row, self.comply, ["Yes", "No"], 80).pack(side="left", padx=(8, 26))
+        label(row, "Recommended status:", 12, SOFT).pack(side="left")
+        self.status_combo = combo(row, self.status_text, self.status_values, 190)
+        self.status_combo.pack(side="left", padx=(8, 10))
+        self.load_btn = button(row, "Load options from page", self._load_status_options, width=190, state="disabled")
+        self.load_btn.pack(side="left")
 
         # buttons
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.pack(fill="x", padx=24, pady=(8, 2))
-        self.start_btn = button(bar, "▶  Open browser", self._start, primary=True, width=160)
+        self.start_btn = button(bar, "▶  Open browser", self._start, primary=True, width=150)
         self.start_btn.pack(side="left")
-        self.login_btn = button(bar, "Ready - add farmers", self._ready, width=180, state="disabled")
+        self.login_btn = button(bar, "Ready - add farmers", self._ready, width=170, state="disabled")
         self.login_btn.pack(side="left", padx=10)
-        self.pause_btn = button(bar, "❚❚  Pause", self._pause, width=120, state="disabled")
+        self.pause_btn = button(bar, "❚❚  Pause", self._pause, width=110, state="disabled")
         self.pause_btn.pack(side="left")
-        self.stop_btn = button(bar, "■  Stop", self._stop, width=120, state="disabled")
+        self.stop_btn = button(bar, "■  Stop", self._stop, width=110, state="disabled")
         self.stop_btn.pack(side="left", padx=10)
-        button(bar, "Open results folder", self._open_out, width=160).pack(side="right")
+        self.comp_btn = button(bar, "Fill compliance page", self._fill_compliance, width=180, state="disabled")
+        self.comp_btn.pack(side="left")
+        button(bar, "Results folder", self._open_out, width=120).pack(side="right")
 
         # progress + log
         head = ctk.CTkFrame(self, fg_color="transparent")
@@ -1416,6 +1615,8 @@ class MainScreen(ctk.CTkFrame):
         for ev in (self.stop_event, self.login_event, self.pause_event, self.close_event):
             ev.clear()
         self.adding_done = False
+        while not self.cmd_q.empty():
+            self.cmd_q.get_nowait()
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal", text="■  Stop")
         self.prog.set(0)
@@ -1425,7 +1626,8 @@ class MainScreen(ctk.CTkFrame):
         self.worker.start()
 
     def _worker(self, cfg):
-        runner = Runner(cfg, self.q.put, self.stop_event, self.login_event, self.pause_event, self.close_event)
+        runner = Runner(cfg, self.q.put, self.stop_event, self.login_event, self.pause_event, self.close_event,
+                        self.cmd_q)
         try:
             counts, stopped = asyncio.run(runner.run())
             self.q.put(("done", counts, stopped, None))
@@ -1440,7 +1642,34 @@ class MainScreen(ctk.CTkFrame):
         self.login_btn.configure(state="disabled", fg_color=BTN_BG, hover_color="#1f1f26", border_width=1,
                                  text_color=TEXT)
         self.pause_btn.configure(state="normal")
+        self._set_compliance_buttons(False)
         self.status.configure(text="Adding farmers...", text_color=MUTED)
+
+    def _fill_compliance(self):
+        status = self.status_text.get().strip()
+        answer = self.comply.get().strip() or "Yes"
+        what = (f"answer \"{answer}\" for every clause and set every member's Recommended Status to \"{status}\""
+                if status else f"answer \"{answer}\" for every clause (members left as they are)")
+        if ask(self.app, "Fill the compliance page?",
+               f"The tool will {what} on the page that is open in the browser.\n\n"
+               "It does not press Submit - you check the page and do that yourself.",
+               ("Cancel", "Fill page"), primary=1, tone="info") != 1:
+            return
+        self._save_ui_settings()
+        self.comp_btn.configure(state="disabled")
+        self.load_btn.configure(state="disabled")
+        self.status.configure(text="Filling the compliance page...", text_color=MUTED)
+        self.cmd_q.put(("compliance", {"answer": answer, "status": status}))
+
+    def _load_status_options(self):
+        self.comp_btn.configure(state="disabled")
+        self.load_btn.configure(state="disabled")
+        self.cmd_q.put(("status_options",))
+
+    def _set_compliance_buttons(self, on):
+        st = "normal" if on else "disabled"
+        self.comp_btn.configure(state=st)
+        self.load_btn.configure(state=st)
 
     def _pause(self):
         if self.pause_event.is_set():                       # resume
@@ -1481,8 +1710,21 @@ class MainScreen(ctk.CTkFrame):
                 elif m[0] == "login":
                     self.login_btn.configure(state="normal", fg_color="#f1f1f4", hover_color="#ffffff",
                                              text_color="#0b0b0d", border_width=0)
+                    self._set_compliance_buttons(True)
                     self.status.configure(text="Waiting: log in, open Add Peers Appraisal, fill the top part and "
                                                "dates, then click \"Ready - add farmers\"", text_color=AMBER)
+                elif m[0] == "status_options":
+                    self.status_values = list(m[1])
+                    self.status_combo.configure(values=self.status_values)
+                    want = self.status_text.get().strip()
+                    if not any(re.sub(r"[^a-z0-9]", "", v.lower()) == re.sub(r"[^a-z0-9]", "", want.lower())
+                               for v in self.status_values):
+                        self.status_text.set(self.status_values[0])
+                elif m[0] == "cmd_done":
+                    if self.is_running():
+                        self._set_compliance_buttons(not self.pause_btn.cget("state") == "normal" or self.adding_done)
+                        self.status.configure(text="Done - check the page in the browser" if m[1] == "compliance"
+                                              else self.status.cget("text"), text_color=GREEN if m[1] == "compliance" else MUTED)
                 elif m[0] == "paused":
                     if m[1]:
                         self.status.configure(text="Paused - click Resume to continue", text_color=AMBER)
@@ -1507,17 +1749,19 @@ class MainScreen(ctk.CTkFrame):
         self.pause_event.clear()
         self.pause_btn.configure(text="❚❚  Pause", state="disabled")
         self.stop_btn.configure(state="normal", text="■  Close browser")
+        self._set_compliance_buttons(True)
         self._write("=== " + ("Stopped" if stopped else "Finished adding") + " ===", "head")
         self._write(f"  Added: {counts['added']}", "ok")
         self._write(f"  Skipped (no rule / not in list): {counts['skipped']}", "warn" if counts["skipped"] else "info")
         self._write(f"  Failed: {counts['failed']}", "err" if counts["failed"] else "info")
-        self._write("  The browser is still open. Check the list there, then click Save & Next yourself. "
-                    "Use \"Close browser\" (or close the window) when you are done.", "head")
+        self._write("  The browser is still open. Check the list there, click Save & Next yourself, then use "
+                    "\"Fill compliance page\" on the next page. Use \"Close browser\" when you are done.", "head")
         self.status.configure(text="Done - check the list in the browser, then Save & Next", text_color=GREEN)
         ask(self.app, "Stopped" if stopped else "Finished adding",
             f"Added: {counts['added']}\nSkipped: {counts['skipped']}\nFailed: {counts['failed']}\n\n"
             "The browser is still open on the Add Peers Appraisal page. Check the farmers list, fix anything "
-            "marked Skipped or Failed by hand, then click Save & Next yourself.\n\n"
+            "marked Skipped or Failed by hand, then click Save & Next yourself. On the next page, click "
+            "\"Fill compliance page\" here.\n\n"
             "A list of every farmer (Excel) is in the results folder.", tone="ok")
 
     def _finished(self, counts, stopped, error):
@@ -1526,6 +1770,7 @@ class MainScreen(ctk.CTkFrame):
         self.stop_btn.configure(state="disabled", text="■  Stop")
         self.pause_event.clear()
         self.pause_btn.configure(text="❚❚  Pause", state="disabled")
+        self._set_compliance_buttons(False)
         self.login_btn.configure(state="disabled", fg_color=BTN_BG, hover_color="#1f1f26", border_width=1,
                                  text_color=TEXT)
         if error:
@@ -1543,6 +1788,7 @@ class MainScreen(ctk.CTkFrame):
             "rules": [[v.get() for v in row] for row in self.rules],
             "start_at": self.start_at.get(), "max_count": self.max_count.get(), "test_mode": self.test_mode.get(),
             "slow_mo": self.slow_mo.get(), "out": self.out_dir.get(),
+            "comply": self.comply.get(), "status_text": self.status_text.get(), "status_values": self.status_values,
         })
 
     def _load_ui_settings(self):
@@ -1559,6 +1805,10 @@ class MainScreen(ctk.CTkFrame):
         self.test_mode.set(d.get("test_mode", False))
         self.slow_mo.set(d.get("slow_mo", "100"))
         self.out_dir.set(d.get("out", str(default_output_dir())))
+        self.comply.set(d.get("comply", "Yes"))
+        self.status_values = list(d.get("status_values") or ["PGS GREEN 2"])
+        self.status_combo.configure(values=self.status_values)
+        self.status_text.set(d.get("status_text", "PGS GREEN 2"))
 
 
 # ───────────────────────────── application window ─────────────────────────────
