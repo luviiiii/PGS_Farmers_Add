@@ -1410,7 +1410,7 @@ class MainScreen(ctk.CTkFrame):
         self.status_values = ["PGS GREEN 2"]
         self.category = tk.StringVar(value="CEREALS")
         self.crop = tk.StringVar(value="PADDY (DHAN)")
-        defaults = [("2", "2", "6", "5"), ("1", "1", "3", "3"), ("", "", "", "")]
+        defaults = [("2", "2", "6", "5"), ("1", "1", "3", "3")] + [("", "", "", "")] * 3
         self.rules = [[tk.StringVar(value=v) for v in row] for row in defaults]
         self.start_at = tk.StringVar(value="1")
         self.max_count = tk.StringVar(value="")
@@ -1823,7 +1823,7 @@ class App(ctk.CTk):
         except Exception:
             pass
         sw, sh = self.winfo_screenwidth() / scale, self.winfo_screenheight() / scale
-        w, h = int(min(1080, sw - 40)), int(min(820, sh - 70))
+        w, h = int(min(1080, sw - 40)), int(min(900, sh - 70))
         self.geometry(f"{w}x{h}+{int(max(0, (sw - w) / 2 * scale))}+{int(max(0, (sh - h) / 3 * scale))}")
         self.minsize(900, 680)
         self._factories = {"launcher": LauncherScreen, "install": InstallScreen, "main": MainScreen}
