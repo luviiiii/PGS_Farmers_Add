@@ -87,6 +87,11 @@ def norm(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip().lower()
 
 
+def mkey(text: str) -> str:
+    """Name key that ignores case, dots, slashes and extra spaces:  'MAHENDRA CH. DAS' == 'mahendra ch das'."""
+    return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
+
+
 def to_num(text):
     return float(str(text).replace(",", "").strip())
 
@@ -102,6 +107,9 @@ class Config:
     crop: str = "PADDY (DHAN)"
     # (offered for organic, area shown, expected yield, self consumption) - all in the portal's units
     rules: tuple = (("2", "2", "6", "5"), ("1", "1", "3", "3"))
+    # farmers with their own numbers: (part of the farmer's name, offered, expected yield, self consumption)
+    specials: tuple = ()
+    expect_group: str = ""      # group name the Excel sheet is for (checked against the portal page)
     start_at: int = 1           # start at this farmer number of the dropdown list
     max_count: int = 0          # 0 = all farmers
     test_mode: bool = False     # fill the first farmer but do NOT press ADD
@@ -122,6 +130,127 @@ def find_rule(cfg: Config, offered: float):
         except ValueError:
             continue
     return None
+
+
+def parse_specials(text: str):
+    """One farmer per line:  name, offered, expected yield, self consumption  (tab / comma / ; / | separated,
+    so a few cells can be pasted straight from Excel). Returns (specials, error_message_or_None)."""
+    out = []
+    pat = re.compile(r"^(.*?)\s*[\t,;|]+\s*([\d.]+)\s*[\t,;|]+\s*([\d.]+)\s*[\t,;|]+\s*([\d.]+)\s*$")
+    for n, line in enumerate(str(text or "").splitlines(), start=1):
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        m = pat.match(line.strip())
+        if not m or not norm(m.group(1)):
+            return None, (f"Special farmers, line {n}: use  farmer name, offered, expected yield, self consumption "
+                          f"(example: HUSSAIN AHMED, 3, 5.5, 5.4).")
+        try:
+            vals = [to_num(m.group(i)) for i in (2, 3, 4)]
+        except ValueError:
+            return None, f"Special farmers, line {n}: the three numbers must be plain numbers."
+        out.append((m.group(1).strip(), m.group(2), m.group(3), m.group(4)))
+    return tuple(out), None
+
+
+def _sheet_group(rows):
+    for r in rows[:15]:
+        cells = [c for c in r if c not in (None, "")]
+        for k, c in enumerate(cells):
+            if "local group name" in norm(c) and k + 1 < len(cells):
+                return re.sub(r"\s+", " ", str(cells[k + 1])).strip()
+    return ""
+
+
+def excel_sheets(path: str):
+    """[(sheet name, local group name found on that sheet)] - one sheet per group in the appraisal workbook."""
+    try:
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    except Exception as e:
+        return None, f"Could not open the Excel file: {e}"
+    out = []
+    for ws in wb.worksheets:
+        rows = [list(r) for r in ws.iter_rows(min_row=1, max_row=15, values_only=True)]
+        out.append((ws.title, _sheet_group(rows)))
+    wb.close()
+    return out, None
+
+
+def read_specials_excel(path: str, sheet_index: int = 0):
+    """Reads one sheet: a row per farmer with name (+ father / husband name), area, expected yield and self
+    consumption. 'Area sown' (or 'offered') is used both as the offered area to check and as the area shown.
+    Headers are recognised by their words; with no headers the first four columns are name, offered, expected,
+    self. Returns (lines, skipped_count, error)."""
+    try:
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    except Exception as e:
+        return None, 0, f"Could not open the Excel file: {e}"
+    ws = wb.worksheets[min(max(sheet_index, 0), len(wb.worksheets) - 1)]
+    rows = [list(r) for r in ws.iter_rows(values_only=True)]
+    wb.close()
+    cols, father, first = (0, 1, 2, 3), None, 0
+    for i, r in enumerate(rows[:20]):
+        cells = [norm(c) for c in r]
+        def find(*words, skip=()):
+            for j, c in enumerate(cells):
+                if c and j not in skip and any(w in c for w in words):
+                    return j
+            return None
+        f = find("father", "husband")
+        n = find("farmer name", "name of farmer", "farmer", "name", skip=() if f is None else (f,))
+        o = find("area sown", "offered", "area")
+        y = find("expected", "yield")
+        sc = find("self")
+        if None not in (n, o, y, sc) and len({n, o, y, sc}) == 4:
+            cols, father, first = (n, o, y, sc), f, i + 1
+            break
+    lines, skipped = [], 0
+    for r in rows[first:]:
+        def cell(k):
+            return r[k] if k is not None and k < len(r) else None
+        name = re.sub(r"\s+", " ", re.sub(r"[\t,;|]+", " ", str(cell(cols[0]) or ""))).strip()
+        if not name:
+            continue                                  # blank rows and the totals row carry no farmer name
+        dad = re.sub(r"\s+", " ", re.sub(r"[\t,;|]+", " ", str(cell(father) or ""))).strip() if father is not None else ""
+        try:
+            nums = [to_num(cell(c)) for c in cols[1:]]
+        except (ValueError, TypeError):
+            skipped += 1
+            continue
+        lines.append(f"{name}{' S/O ' + dad if dad else ''}, " + ", ".join(fmt_num(round(x, 6)) for x in nums))
+    if not lines:
+        return None, skipped, ("No farmer rows found on that sheet. It needs the farmer name, area, expected yield "
+                               "and self consumption in each row.")
+    return lines, skipped, None
+
+
+def parse_group_comment(text: str) -> str:
+    """The '# group: <name>' line that 'Load from Excel' writes at the top of the farmers box."""
+    for line in str(text or "").splitlines():
+        m = re.match(r"^\s*#\s*group\s*:\s*(.*?)\s*(?:\(sheet:.*\))?\s*$", line, re.I)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def special_map(specials, options):
+    """Which dropdown farmer gets which line(s). Returns ({farmer text: [lines]}, {farmer text: why skipped},
+    [lines that matched nobody]). Two farmers with the same name and father are fine - each takes the line whose
+    offered area matches what the portal shows."""
+    chosen, clash, unmatched = {}, {}, []
+    for line in specials:
+        key = mkey(line[0])
+        hits = [t for _, t in options if key == mkey(t)] or [t for _, t in options if key and key in mkey(t)]
+        texts = set(hits)
+        if not hits:
+            unmatched.append(line[0])
+        elif len(texts) > 1:
+            for t in texts:
+                clash[t] = f"special line '{line[0]}' matches {len(texts)} different farmers - type more of the name"
+        else:
+            chosen.setdefault(hits[0], []).append(line)
+    for t in clash:
+        chosen.pop(t, None)
+    return chosen, clash, unmatched
 
 
 def pick_option(options, wanted):
@@ -206,6 +335,7 @@ class Runner:
         self.close_event = close_event      # set = close the browser when the farmers are done
         self.cmd_q = cmd_q                  # jobs for the compliance page: ("compliance", {...}) / ("status_options",)
         self.dialog_msgs = []
+        self.special_for, self.special_clash = {}, {}
         self.rows = []
         self.csv_path = None
         self.xlsx_path = None
@@ -338,6 +468,36 @@ class Runner:
         else:
             await sel.select_option(label=t, timeout=ACTION_TIMEOUT)
 
+    _JS_LEADER = r"""() => {
+        const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+        const els = [...document.querySelectorAll('body *')];
+        const own = e => [...e.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join(' ');
+        for (let i = 0; i < els.length; i++) {
+            const m = norm(own(els[i])).match(/^leader name\s*:?\s*(.*)$/i);
+            if (!m) continue;
+            if (m[1]) return m[1];
+            for (let j = i + 1; j < els.length; j++) { const t = norm(own(els[j])); if (t) return t; }
+        }
+        return '';
+    }"""
+
+    async def check_group(self, page, expected):
+        """The Excel sheet must belong to the group whose appraisal is open."""
+        try:
+            on_page = (await page.evaluate(self._JS_LEADER)).strip()
+        except Exception:
+            on_page = ""
+        if not on_page:
+            self.log("   (could not read the group name from the page, so the Excel sheet could not be checked "
+                     "against it)", "warn")
+            return
+        if mkey(expected) == mkey(on_page):
+            self.log(f"Excel sheet matches this group: {on_page}", "ok")
+            return
+        raise FatalError(f"The Excel sheet you loaded is for the group\n   {expected}\nbut the open appraisal is "
+                         f"for\n   {on_page}\nLoad the sheet of this group. (If it is the right sheet and only the "
+                         "spelling differs, edit or delete the '# group:' line at the top of the farmers box.)")
+
     async def wait_option(self, sel, wanted, timeout=12.0):
         """The options of Crop Category / Crop are loaded by the portal after the previous choice."""
         end = time.time() + timeout
@@ -425,11 +585,29 @@ class Runner:
                 return ("Failed",) + blank + ("the portal changed a dropdown while selecting - nothing was added",)
             return ("Failed",) + blank + (f"could not read 'Offered for organic' (found {raw!r})",)
 
-        rule = find_rule(cfg, offered)
         shown = fmt_num(offered)
-        if rule is None:
-            return ("Skipped", shown, "", "", "", f"no rule for offered area {shown} ha - fill this farmer by hand")
-        _, area, yld, own = rule
+        note = ""
+        if text in self.special_clash:
+            return ("Skipped", shown, "", "", "", self.special_clash[text])
+        lines = self.special_for.get(text)
+        if lines:
+            cands = [l for l in lines if abs(to_num(l[1]) - offered) <= 1e-6]
+            if not cands:
+                said = " / ".join(sorted({l[1] for l in lines}))
+                return ("Skipped", shown, "", "", "", f"the Excel / special line says {said} ha but the portal shows "
+                                                      f"{shown} ha - fill this farmer by hand")
+            if len({(l[2], l[3]) for l in cands}) > 1:
+                return ("Skipped", shown, "", "", "", "several lines with this name and area have different "
+                                                      "numbers - fill this farmer by hand")
+            sp = cands[0]
+            lines.remove(sp)                      # a second farmer with the same name takes the next line
+            area, yld, own = shown, sp[2], sp[3]
+            note = "special numbers"
+        else:
+            rule = find_rule(cfg, offered)
+            if rule is None:
+                return ("Skipped", shown, "", "", "", f"no rule for offered area {shown} ha - fill this farmer by hand")
+            _, area, yld, own = rule
         for key, val in (("area", area), ("yield", yld), ("self", own)):
             await f[key].fill(val, timeout=ACTION_TIMEOUT)
         got = [(await f[k].input_value()).strip() for k in ("area", "yield", "self")]
@@ -437,7 +615,7 @@ class Runner:
             return ("Failed", shown, area, yld, own, f"the numbers did not stay in the boxes (read back {got})")
 
         if cfg.test_mode:
-            return ("Test", shown, area, yld, own, "test mode - ADD was NOT pressed")
+            return ("Test", shown, area, yld, own, (note + " - " if note else "") + "test mode - ADD was NOT pressed")
 
         btn = await self.add_button(f)
         rows_before = await self.row_count(page)
@@ -450,14 +628,14 @@ class Runner:
             if len(self.dialog_msgs) > dialogs_before:
                 msg = " / ".join(self.dialog_msgs[dialogs_before:])
                 if re.search(r"success|added|saved", msg, re.I) and not re.search(r"not|invalid|error|fail|already", msg, re.I):
-                    return ("Added", shown, area, yld, own, msg[:120])
+                    return ("Added", shown, area, yld, own, (note + " - " if note else "") + msg[:120])
                 return ("Failed", shown, area, yld, own, f"portal said: {msg[:200]}")
             if page.is_closed():
                 raise FatalError("The browser window was closed.")
             gone = not any(v == farmer_opt[0] and t == farmer_opt[1] for v, t in await self.read_options(f["farmer"]))
             reset = norm(await self.selected_text(f["farmer"])).startswith("--") or (await f["area"].input_value()).strip() == ""
             if gone or reset or await self.row_count(page) > rows_before:
-                return ("Added", shown, area, yld, own, "")
+                return ("Added", shown, area, yld, own, note)
         return ("Failed", shown, area, yld, own, "pressing ADD had no visible effect (nothing was added)")
 
     # -- compliance page (after Save & Next) --
@@ -685,12 +863,24 @@ class Runner:
                                      "\"Ready - add farmers\" again.", "err")
                             self.log(f"   (page details saved in {dump})", "warn")
                     await page.bring_to_front()
+                    if cfg.expect_group:
+                        await self.check_group(page, cfg.expect_group)
 
                     options = [o for o in await self.read_options(f["farmer"])
                                if not norm(o[1]).startswith("--") and norm(o[1]) not in ("", "select")]
                     if not options:
                         raise FatalError("The Farmer dropdown is empty. Make sure the Season/Month/Year at the top "
                                          "are filled in, then try again.")
+                    if cfg.specials:
+                        self.special_for, self.special_clash, unmatched = special_map(cfg.specials, options)
+                        covered = sum(1 for _, t in options if t in self.special_for)
+                        others = len(options) - covered - len(self.special_clash)
+                        self.log(f"Excel / special numbers found for {covered} farmer(s); {others} other farmer(s) in "
+                                 "the dropdown use the rules table.", "head")
+                        for name in unmatched:
+                            self.log(f"   no farmer in the dropdown matches the special line '{name}'", "warn")
+                        for t, why in self.special_clash.items():
+                            self.log(f"   {t}: {why}", "warn")
                     start = max(1, cfg.start_at)
                     todo = list(enumerate(options, start=1))[start - 1:]
                     if cfg.max_count:
@@ -747,6 +937,12 @@ class Runner:
                         counts[key] += 1
                         self.emit(("progress", n, total, dict(counts)))
 
+                    if (cfg.specials and not stopped and not cfg.test_mode and not cfg.max_count
+                            and cfg.start_at <= 1):
+                        for t, ls in self.special_for.items():
+                            for l in ls:
+                                self.log(f"   Excel line not used (portal offered area did not match, or the farmer "
+                                         f"was not added): {l[0]}", "warn")
                     try:
                         if write_excel(self.xlsx_path, self.rows):
                             self.log(f"Excel file saved: {self.xlsx_path}", "ok")
@@ -1392,6 +1588,36 @@ def checkbox(parent, text, var):
                            checkmark_color="#0b0b0d", text_color=TEXT, font=F(12))
 
 
+def pick_sheet(parent, sheets):
+    """Small modal window: choose which sheet (group) of the workbook to load. Returns the index or None."""
+    win = ctk.CTkToplevel(parent)
+    win.title("Which sheet?")
+    win.configure(fg_color=BG)
+    win.geometry("640x230")
+    win.transient(parent)
+    result = {"i": None}
+    names = [f"{n.strip()}   -   {g}" if g else n.strip() for n, g in sheets]
+    var = tk.StringVar(value=names[0])
+    label(win, "This Excel has one sheet per group. Choose the group you are working on:", 13, TEXT).pack(
+        padx=24, pady=(22, 10), anchor="w")
+    combo(win, var, names, 590).pack(padx=24, anchor="w")
+    bar = ctk.CTkFrame(win, fg_color="transparent")
+    bar.pack(side="bottom", fill="x", padx=24, pady=20)
+
+    def ok():
+        result["i"] = names.index(var.get()) if var.get() in names else 0
+        win.destroy()
+    button(bar, "Load this sheet", ok, primary=True, width=160).pack(side="right")
+    button(bar, "Cancel", win.destroy, width=110).pack(side="right", padx=10)
+    win.after(200, lambda: (win.lift(), win.focus_force()))
+    try:
+        win.grab_set()
+    except Exception:
+        pass
+    parent.wait_window(win)
+    return result["i"]
+
+
 class MainScreen(ctk.CTkFrame):
     def __init__(self, app):
         super().__init__(app, fg_color=BG)
@@ -1435,8 +1661,11 @@ class MainScreen(ctk.CTkFrame):
         label(hdr, "Adds every farmer to a Peers Appraisal on pgsindia-ncof.gov.in with the right area and yield",
               11, MUTED).grid(row=2, column=2, sticky="w")
 
+        body = ctk.CTkScrollableFrame(self, fg_color="transparent", corner_radius=0)
+        body.pack(fill="both", expand=True, padx=(0, 4))
+
         # 1 - what to enter
-        c1 = Card(self, 1, "What to enter for every farmer", "Crop and the numbers that go with each 'Offered for organic' value")
+        c1 = Card(body, 1, "What to enter for every farmer", "Crop and the numbers that go with each 'Offered for organic' value")
         c1.pack(fill="x", padx=24, pady=4)
         b = c1.body
         row = ctk.CTkFrame(b, fg_color="transparent")
@@ -1445,19 +1674,32 @@ class MainScreen(ctk.CTkFrame):
         entry(row, self.category, width=150).pack(side="left", padx=(8, 30))
         label(row, "Crop:", 12, SOFT).pack(side="left")
         entry(row, self.crop, width=190).pack(side="left", padx=(8, 0))
-        grid = ctk.CTkFrame(b, fg_color="transparent")
-        grid.pack(fill="x", pady=(10, 0))
-        for c, head in enumerate(("If 'Offered for organic' is (ha)", "Area shown (Ha)", "Expected yield (qt)",
-                                  "Self consumption (qt)")):
-            label(grid, head, 11, MUTED).grid(row=0, column=c, padx=(0, 14), sticky="w")
+        mid = ctk.CTkFrame(b, fg_color="transparent")
+        mid.pack(fill="x", pady=(10, 0))
+        grid = ctk.CTkFrame(mid, fg_color="transparent")
+        grid.pack(side="left", anchor="n")
+        for c, head in enumerate(("Offered (ha)", "Area (Ha)", "Exp. yield (qt)", "Self cons. (qt)")):
+            label(grid, head, 11, MUTED).grid(row=0, column=c, padx=(0, 10), sticky="w")
         for r, vars_ in enumerate(self.rules, start=1):
             for c, var in enumerate(vars_):
-                entry(grid, var, width=150 if c == 0 else 130).grid(row=r, column=c, padx=(0, 14), pady=(3, 0), sticky="w")
+                entry(grid, var, width=105).grid(row=r, column=c, padx=(0, 10), pady=(3, 0), sticky="w")
+        sp = ctk.CTkFrame(mid, fg_color="transparent")
+        sp.pack(side="left", fill="both", expand=True, padx=(18, 0))
+        top = ctk.CTkFrame(sp, fg_color="transparent")
+        top.pack(fill="x")
+        label(top, "Farmers with their own numbers:", 11, SOFT).pack(side="left")
+        button(top, "Load from Excel...", self._load_specials_excel, width=140).pack(side="right")
+        label(sp, "one per line - name, offered, expected yield, self consumption (or load an Excel)", 11, MUTED,
+              anchor="w").pack(fill="x")
+        self.special_box = ctk.CTkTextbox(sp, height=120, corner_radius=8, fg_color=FIELD, border_width=1,
+                                          border_color=FIELD_BORDER, text_color=TEXT, font=(MONO, 12), wrap="none")
+        self.special_box.pack(fill="both", expand=True, pady=(3, 0))
+        label(sp, "e.g.  HUSSAIN AHMED, 3, 5.5, 5.4   (area = offered)", 11, MUTED, anchor="w").pack(fill="x", pady=(3, 0))
         label(b, "A farmer whose 'Offered for organic' matches none of these rows is skipped and listed in the "
                  "result - nothing is guessed.", 11, MUTED, anchor="w").pack(fill="x", pady=(8, 0))
 
         # 2 - options
-        c2 = Card(self, 2, "Options", "Which farmers, speed, and where the result is saved")
+        c2 = Card(body, 2, "Options", "Which farmers, speed, and where the result is saved")
         c2.pack(fill="x", padx=24, pady=4)
         b = c2.body
         row = ctk.CTkFrame(b, fg_color="transparent")
@@ -1477,7 +1719,7 @@ class MainScreen(ctk.CTkFrame):
         label(row, "Save results to:", 12, SOFT).pack(side="right", padx=(0, 10))
 
         # 3 - compliance page
-        c3 = Card(self, 3, "Compliance page", "After you click Save & Next - the page with the Yes / No table")
+        c3 = Card(body, 3, "Compliance page", "After you click Save & Next - the page with the Yes / No table")
         c3.pack(fill="x", padx=24, pady=4)
         b = c3.body
         row = ctk.CTkFrame(b, fg_color="transparent")
@@ -1514,9 +1756,9 @@ class MainScreen(ctk.CTkFrame):
         self.prog = ctk.CTkProgressBar(self, height=5, corner_radius=3, fg_color="#1b1b20", progress_color="#e9e9ee")
         self.prog.pack(fill="x", padx=28, pady=(4, 4))
         self.prog.set(0)
-        self.log = ctk.CTkTextbox(self, height=90, corner_radius=12, fg_color="#050506", border_width=1,
+        self.log = ctk.CTkTextbox(self, height=170, corner_radius=12, fg_color="#050506", border_width=1,
                                   border_color=CARD_BORDER, text_color=SOFT, font=(MONO, 12), wrap="word")
-        self.log.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+        self.log.pack(fill="x", padx=24, pady=(0, 16))
         for tag, col in (("ok", GREEN), ("err", RED), ("warn", AMBER), ("head", "#ffffff")):
             self.log.tag_config(tag, foreground=col)
         self.log.configure(state="disabled")
@@ -1532,6 +1774,29 @@ class MainScreen(ctk.CTkFrame):
         p = filedialog.askdirectory(title="Folder for the results")
         if p:
             self.out_dir.set(p)
+
+    def _load_specials_excel(self):
+        p = filedialog.askopenfilename(title="Excel with the farmers, area, expected yield and self consumption",
+                                       filetypes=[("Excel files", "*.xlsx *.xlsm"), ("All files", "*.*")])
+        if not p:
+            return
+        sheets, err = excel_sheets(p)
+        if err:
+            return self._bad(err)
+        idx = 0
+        if len(sheets) > 1:
+            idx = pick_sheet(self.app, sheets)
+            if idx is None:
+                return
+        lines, skipped, err = read_specials_excel(p, idx)
+        if err:
+            return self._bad(err)
+        sheet, group = sheets[idx]
+        head = f"# group: {group or sheet}  (sheet: {sheet.strip()})\n"
+        self.special_box.delete("1.0", "end")
+        self.special_box.insert("1.0", head + "\n".join(lines))
+        self._write(f"Loaded {len(lines)} farmer(s) from sheet '{sheet.strip()}' of {Path(p).name}"
+                    + (f" ({skipped} row(s) without usable numbers were left out)" if skipped else "") + ".", "ok")
 
     def _open_out(self):
         p = Path(self.out_dir.get().strip() or default_output_dir())
@@ -1572,6 +1837,10 @@ class MainScreen(ctk.CTkFrame):
             rules.append(tuple(vals))
         if not rules:
             return self._bad("Please enter at least one rule row.")
+        specials, err = parse_specials(self.special_box.get("1.0", "end"))
+        expect_group = parse_group_comment(self.special_box.get("1.0", "end"))
+        if err:
+            return self._bad(err)
         try:
             start = int(self.start_at.get())
             if start < 1:
@@ -1592,7 +1861,7 @@ class MainScreen(ctk.CTkFrame):
         except ValueError:
             return self._bad("Delay must be a number of milliseconds.")
         return Config(out_dir=self.out_dir.get().strip() or str(default_output_dir()), category=category, crop=crop,
-                      rules=tuple(rules), start_at=start, max_count=mx, test_mode=self.test_mode.get(), slow_mo=slow,
+                      rules=tuple(rules), specials=specials, expect_group=expect_group, start_at=start, max_count=mx, test_mode=self.test_mode.get(), slow_mo=slow,
                       browser_channel=load_settings().get("browser_channel", ""))
 
     # ── actions ──
@@ -1602,274 +1871,5 @@ class MainScreen(ctk.CTkFrame):
             return
         rules = "\n".join(f"   offered {r[0]} ha  ->  area {r[1]}, expected yield {r[2]}, self consumption {r[3]}"
                           for r in cfg.rules)
-        who = ("the FIRST farmer only (test mode - ADD is not pressed)" if cfg.test_mode else
-               "every farmer in the dropdown" if not cfg.max_count else f"{cfg.max_count} farmer(s)")
-        if ask(self.app, "Open the browser?",
-               f"The tool will add {who} with  {cfg.category} / {cfg.crop}  and these numbers:\n{rules}\n\n"
-               "It opens a browser. You log in, open Add Peers Appraisal and fill in the top part and the dates "
-               "yourself, then click \"Ready - add farmers\" here.\n\n"
-               "It never presses Save & Next - you do that yourself after checking the list.",
-               ("Cancel", "Open browser"), primary=1, tone="info") != 1:
-            return
-        self._save_ui_settings()
-        for ev in (self.stop_event, self.login_event, self.pause_event, self.close_event):
-            ev.clear()
-        self.adding_done = False
-        while not self.cmd_q.empty():
-            self.cmd_q.get_nowait()
-        self.start_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal", text="■  Stop")
-        self.prog.set(0)
-        self.status.configure(text="Opening browser...", text_color=MUTED)
-        self._write(f"=== Started {datetime.now():%Y-%m-%d %H:%M:%S} ===", "head")
-        self.worker = threading.Thread(target=self._worker, args=(cfg,), daemon=True)
-        self.worker.start()
-
-    def _worker(self, cfg):
-        runner = Runner(cfg, self.q.put, self.stop_event, self.login_event, self.pause_event, self.close_event,
-                        self.cmd_q)
-        try:
-            counts, stopped = asyncio.run(runner.run())
-            self.q.put(("done", counts, stopped, None))
-        except FatalError as e:
-            self.q.put(("done", None, False, str(e)))
-        except Exception as e:
-            self.q.put(("log", "err", traceback.format_exc(limit=4)))
-            self.q.put(("done", None, False, f"Unexpected error: {str(e).strip().splitlines()[0][:200] if str(e).strip() else type(e).__name__}"))
-
-    def _ready(self):
-        self.login_event.set()
-        self.login_btn.configure(state="disabled", fg_color=BTN_BG, hover_color="#1f1f26", border_width=1,
-                                 text_color=TEXT)
-        self.pause_btn.configure(state="normal")
-        self._set_compliance_buttons(False)
-        self.status.configure(text="Adding farmers...", text_color=MUTED)
-
-    def _fill_compliance(self):
-        status = self.status_text.get().strip()
-        answer = self.comply.get().strip() or "Yes"
-        what = (f"answer \"{answer}\" for every clause and set every member's Recommended Status to \"{status}\""
-                if status else f"answer \"{answer}\" for every clause (members left as they are)")
-        if ask(self.app, "Fill the compliance page?",
-               f"The tool will {what} on the page that is open in the browser.\n\n"
-               "It does not press Submit - you check the page and do that yourself.",
-               ("Cancel", "Fill page"), primary=1, tone="info") != 1:
-            return
-        self._save_ui_settings()
-        self.comp_btn.configure(state="disabled")
-        self.load_btn.configure(state="disabled")
-        self.status.configure(text="Filling the compliance page...", text_color=MUTED)
-        self.cmd_q.put(("compliance", {"answer": answer, "status": status}))
-
-    def _load_status_options(self):
-        self.comp_btn.configure(state="disabled")
-        self.load_btn.configure(state="disabled")
-        self.cmd_q.put(("status_options",))
-
-    def _set_compliance_buttons(self, on):
-        st = "normal" if on else "disabled"
-        self.comp_btn.configure(state=st)
-        self.load_btn.configure(state=st)
-
-    def _pause(self):
-        if self.pause_event.is_set():                       # resume
-            self.pause_event.clear()
-            self.pause_btn.configure(text="❚❚  Pause")
-            self.status.configure(text="Adding farmers...", text_color=MUTED)
-        else:                                               # pause after the current farmer
-            self.pause_event.set()
-            self.pause_btn.configure(text="▶  Resume")
-            self.status.configure(text="Pausing after the current farmer...", text_color=AMBER)
-
-    def _stop(self):
-        if self.adding_done:                                # button now means "close the browser"
-            self.close_event.set()
-            self.stop_btn.configure(state="disabled")
-            return
-        self.stop_event.set()
-        self.login_event.set()
-        self.stop_btn.configure(state="disabled")
-        self.status.configure(text="Stopping after the current farmer...", text_color=AMBER)
-
-    def is_running(self):
-        return bool(self.worker and self.worker.is_alive())
-
-    def shutdown(self):
-        self.stop_event.set()
-        self.login_event.set()
-        self.close_event.set()
-        self._save_ui_settings()
-
-    # ── event pump ──
-    def _poll(self):
-        try:
-            while True:
-                m = self.q.get_nowait()
-                if m[0] == "log":
-                    self._write(m[2], m[1])
-                elif m[0] == "login":
-                    self.login_btn.configure(state="normal", fg_color="#f1f1f4", hover_color="#ffffff",
-                                             text_color="#0b0b0d", border_width=0)
-                    self._set_compliance_buttons(True)
-                    self.status.configure(text="Waiting: log in, open Add Peers Appraisal, fill the top part and "
-                                               "dates, then click \"Ready - add farmers\"", text_color=AMBER)
-                elif m[0] == "status_options":
-                    self.status_values = list(m[1])
-                    self.status_combo.configure(values=self.status_values)
-                    want = self.status_text.get().strip()
-                    if not any(re.sub(r"[^a-z0-9]", "", v.lower()) == re.sub(r"[^a-z0-9]", "", want.lower())
-                               for v in self.status_values):
-                        self.status_text.set(self.status_values[0])
-                elif m[0] == "cmd_done":
-                    if self.is_running():
-                        self._set_compliance_buttons(not self.pause_btn.cget("state") == "normal" or self.adding_done)
-                        self.status.configure(text="Done - check the page in the browser" if m[1] == "compliance"
-                                              else self.status.cget("text"), text_color=GREEN if m[1] == "compliance" else MUTED)
-                elif m[0] == "paused":
-                    if m[1]:
-                        self.status.configure(text="Paused - click Resume to continue", text_color=AMBER)
-                    else:
-                        self.status.configure(text="Adding farmers...", text_color=MUTED)
-                elif m[0] == "progress":
-                    _, n, total, c = m
-                    self.prog.set(n / max(total, 1))
-                    self.status.configure(
-                        text=f"{n}/{total}   added {c['added']}  |  skipped {c['skipped']}  |  failed {c['failed']}",
-                        text_color=MUTED)
-                elif m[0] == "added_all":
-                    self._added_all(*m[1:])
-                elif m[0] == "done":
-                    self._finished(*m[1:])
-        except queue.Empty:
-            pass
-        self.after(100, self._poll)
-
-    def _added_all(self, counts, stopped, xlsx):
-        self.adding_done = True
-        self.pause_event.clear()
-        self.pause_btn.configure(text="❚❚  Pause", state="disabled")
-        self.stop_btn.configure(state="normal", text="■  Close browser")
-        self._set_compliance_buttons(True)
-        self._write("=== " + ("Stopped" if stopped else "Finished adding") + " ===", "head")
-        self._write(f"  Added: {counts['added']}", "ok")
-        self._write(f"  Skipped (no rule / not in list): {counts['skipped']}", "warn" if counts["skipped"] else "info")
-        self._write(f"  Failed: {counts['failed']}", "err" if counts["failed"] else "info")
-        self._write("  The browser is still open. Check the list there, click Save & Next yourself, then use "
-                    "\"Fill compliance page\" on the next page. Use \"Close browser\" when you are done.", "head")
-        self.status.configure(text="Done - check the list in the browser, then Save & Next", text_color=GREEN)
-        ask(self.app, "Stopped" if stopped else "Finished adding",
-            f"Added: {counts['added']}\nSkipped: {counts['skipped']}\nFailed: {counts['failed']}\n\n"
-            "The browser is still open on the Add Peers Appraisal page. Check the farmers list, fix anything "
-            "marked Skipped or Failed by hand, then click Save & Next yourself. On the next page, click "
-            "\"Fill compliance page\" here.\n\n"
-            "A list of every farmer (Excel) is in the results folder.", tone="ok")
-
-    def _finished(self, counts, stopped, error):
-        self.adding_done = False
-        self.start_btn.configure(state="normal")
-        self.stop_btn.configure(state="disabled", text="■  Stop")
-        self.pause_event.clear()
-        self.pause_btn.configure(text="❚❚  Pause", state="disabled")
-        self._set_compliance_buttons(False)
-        self.login_btn.configure(state="disabled", fg_color=BTN_BG, hover_color="#1f1f26", border_width=1,
-                                 text_color=TEXT)
-        if error:
-            self._write(f"STOPPED WITH ERROR: {error}", "err")
-            self.status.configure(text="Stopped - see log.", text_color=RED)
-            ask(self.app, "The run stopped", error, tone="error")
-            return
-        self._write("Browser closed.", "info")
-        self.status.configure(text="Ready.", text_color=MUTED)
-
-    # ── settings ──
-    def _save_ui_settings(self):
-        save_settings(ui_peer={
-            "category": self.category.get(), "crop": self.crop.get(),
-            "rules": [[v.get() for v in row] for row in self.rules],
-            "start_at": self.start_at.get(), "max_count": self.max_count.get(), "test_mode": self.test_mode.get(),
-            "slow_mo": self.slow_mo.get(), "out": self.out_dir.get(),
-            "comply": self.comply.get(), "status_text": self.status_text.get(), "status_values": self.status_values,
-        })
-
-    def _load_ui_settings(self):
-        d = load_settings().get("ui_peer", {})
-        if not d:
-            return
-        self.category.set(d.get("category", "CEREALS"))
-        self.crop.set(d.get("crop", "PADDY (DHAN)"))
-        for row, saved in zip(self.rules, d.get("rules", [])):
-            for var, val in zip(row, saved):
-                var.set(val)
-        self.start_at.set(d.get("start_at", "1"))
-        self.max_count.set(d.get("max_count", ""))
-        self.test_mode.set(d.get("test_mode", False))
-        self.slow_mo.set(d.get("slow_mo", "100"))
-        self.out_dir.set(d.get("out", str(default_output_dir())))
-        self.comply.set(d.get("comply", "Yes"))
-        self.status_values = list(d.get("status_values") or ["PGS GREEN 2"])
-        self.status_combo.configure(values=self.status_values)
-        self.status_text.set(d.get("status_text", "PGS GREEN 2"))
-
-
-# ───────────────────────────── application window ─────────────────────────────
-class App(ctk.CTk):
-    def __init__(self):
-        super().__init__()
-        self.title(APP_TITLE)
-        self.configure(fg_color=BG)
-        scale = 1.0
-        try:
-            scale = self._get_window_scaling()
-        except Exception:
-            pass
-        sw, sh = self.winfo_screenwidth() / scale, self.winfo_screenheight() / scale
-        w, h = int(min(1080, sw - 40)), int(min(900, sh - 70))
-        self.geometry(f"{w}x{h}+{int(max(0, (sw - w) / 2 * scale))}+{int(max(0, (sh - h) / 3 * scale))}")
-        self.minsize(900, 680)
-        self._factories = {"launcher": LauncherScreen, "install": InstallScreen, "main": MainScreen}
-        self.screens = {}
-        self.current = None
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(300, self._set_icon)
-        self.show("launcher")
-
-    def _set_icon(self):
-        try:
-            if sys.platform == "win32":
-                p = data_dir() / "app.ico"
-                p.write_bytes(base64.b64decode(A.APP_ICO))
-                self.iconbitmap(str(p))
-            else:
-                self._icon_img = tk.PhotoImage(data=A.APP_ICON_PNG)
-                self.iconphoto(True, self._icon_img)
-        except Exception:
-            pass
-
-    def show(self, name):
-        if self.current:
-            self.screens[self.current].pack_forget()
-        if name not in self.screens:
-            self.screens[name] = self._factories[name](self)
-        self.current = name
-        screen = self.screens[name]
-        screen.pack(fill="both", expand=True)
-        if hasattr(screen, "on_show"):
-            screen.on_show()
-
-    def _on_close(self):
-        main = self.screens.get("main")
-        if main is not None:
-            if main.is_running():
-                if ask(self, "Run in progress", "A run is in progress. Stop it and close the app?",
-                       ("Keep running", "Stop and close"), primary=0, tone="warn") != 1:
-                    return
-            main.shutdown()
-        self.destroy()
-
-
-if __name__ == "__main__":
-    if "--make-icon" in sys.argv:            # used by the build to give the exe its icon
-        Path("app.ico").write_bytes(base64.b64decode(A.APP_ICO))
-        print("app.ico written")
-    else:
-        App().mainloop()
+        if cfg.specials:
+            rules += "\n\nFarmers with their own numbers:\n" + "\n".join(
