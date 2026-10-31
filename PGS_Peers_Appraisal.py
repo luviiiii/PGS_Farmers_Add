@@ -1873,3 +1873,278 @@ class MainScreen(ctk.CTkFrame):
                           for r in cfg.rules)
         if cfg.specials:
             rules += "\n\nFarmers with their own numbers:\n" + "\n".join(
+                f"   {sp[0]}: offered {sp[1]} ha, expected yield {sp[2]}, self consumption {sp[3]}" for sp in cfg.specials)
+        who = ("the FIRST farmer only (test mode - ADD is not pressed)" if cfg.test_mode else
+               "every farmer in the dropdown" if not cfg.max_count else f"{cfg.max_count} farmer(s)")
+        if ask(self.app, "Open the browser?",
+               f"The tool will add {who} with  {cfg.category} / {cfg.crop}  and these numbers:\n{rules}\n\n"
+               "It opens a browser. You log in, open Add Peers Appraisal and fill in the top part and the dates "
+               "yourself, then click \"Ready - add farmers\" here.\n\n"
+               "It never presses Save & Next - you do that yourself after checking the list.",
+               ("Cancel", "Open browser"), primary=1, tone="info") != 1:
+            return
+        self._save_ui_settings()
+        for ev in (self.stop_event, self.login_event, self.pause_event, self.close_event):
+            ev.clear()
+        self.adding_done = False
+        while not self.cmd_q.empty():
+            self.cmd_q.get_nowait()
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal", text="■  Stop")
+        self.prog.set(0)
+        self.status.configure(text="Opening browser...", text_color=MUTED)
+        self._write(f"=== Started {datetime.now():%Y-%m-%d %H:%M:%S} ===", "head")
+        self.worker = threading.Thread(target=self._worker, args=(cfg,), daemon=True)
+        self.worker.start()
+
+    def _worker(self, cfg):
+        runner = Runner(cfg, self.q.put, self.stop_event, self.login_event, self.pause_event, self.close_event,
+                        self.cmd_q)
+        try:
+            counts, stopped = asyncio.run(runner.run())
+            self.q.put(("done", counts, stopped, None))
+        except FatalError as e:
+            self.q.put(("done", None, False, str(e)))
+        except Exception as e:
+            self.q.put(("log", "err", traceback.format_exc(limit=4)))
+            self.q.put(("done", None, False, f"Unexpected error: {str(e).strip().splitlines()[0][:200] if str(e).strip() else type(e).__name__}"))
+
+    def _ready(self):
+        self.login_event.set()
+        self.login_btn.configure(state="disabled", fg_color=BTN_BG, hover_color="#1f1f26", border_width=1,
+                                 text_color=TEXT)
+        self.pause_btn.configure(state="normal")
+        self._set_compliance_buttons(False)
+        self.status.configure(text="Adding farmers...", text_color=MUTED)
+
+    def _fill_compliance(self):
+        status = self.status_text.get().strip()
+        answer = self.comply.get().strip() or "Yes"
+        what = (f"answer \"{answer}\" for every clause and set every member's Recommended Status to \"{status}\""
+                if status else f"answer \"{answer}\" for every clause (members left as they are)")
+        if ask(self.app, "Fill the compliance page?",
+               f"The tool will {what} on the page that is open in the browser.\n\n"
+               "It does not press Submit - you check the page and do that yourself.",
+               ("Cancel", "Fill page"), primary=1, tone="info") != 1:
+            return
+        self._save_ui_settings()
+        self.comp_btn.configure(state="disabled")
+        self.load_btn.configure(state="disabled")
+        self.status.configure(text="Filling the compliance page...", text_color=MUTED)
+        self.cmd_q.put(("compliance", {"answer": answer, "status": status}))
+
+    def _load_status_options(self):
+        self.comp_btn.configure(state="disabled")
+        self.load_btn.configure(state="disabled")
+        self.cmd_q.put(("status_options",))
+
+    def _set_compliance_buttons(self, on):
+        st = "normal" if on else "disabled"
+        self.comp_btn.configure(state=st)
+        self.load_btn.configure(state=st)
+
+    def _pause(self):
+        if self.pause_event.is_set():                       # resume
+            self.pause_event.clear()
+            self.pause_btn.configure(text="❚❚  Pause")
+            self.status.configure(text="Adding farmers...", text_color=MUTED)
+        else:                                               # pause after the current farmer
+            self.pause_event.set()
+            self.pause_btn.configure(text="▶  Resume")
+            self.status.configure(text="Pausing after the current farmer...", text_color=AMBER)
+
+    def _stop(self):
+        if self.adding_done:                                # button now means "close the browser"
+            self.close_event.set()
+            self.stop_btn.configure(state="disabled")
+            return
+        self.stop_event.set()
+        self.login_event.set()
+        self.stop_btn.configure(state="disabled")
+        self.status.configure(text="Stopping after the current farmer...", text_color=AMBER)
+
+    def is_running(self):
+        return bool(self.worker and self.worker.is_alive())
+
+    def shutdown(self):
+        self.stop_event.set()
+        self.login_event.set()
+        self.close_event.set()
+        self._save_ui_settings()
+
+    # ── event pump ──
+    def _poll(self):
+        try:
+            while True:
+                m = self.q.get_nowait()
+                if m[0] == "log":
+                    self._write(m[2], m[1])
+                elif m[0] == "login":
+                    self.login_btn.configure(state="normal", fg_color="#f1f1f4", hover_color="#ffffff",
+                                             text_color="#0b0b0d", border_width=0)
+                    self._set_compliance_buttons(True)
+                    self.status.configure(text="Waiting: log in, open Add Peers Appraisal, fill the top part and "
+                                               "dates, then click \"Ready - add farmers\"", text_color=AMBER)
+                elif m[0] == "status_options":
+                    self.status_values = list(m[1])
+                    self.status_combo.configure(values=self.status_values)
+                    want = self.status_text.get().strip()
+                    if not any(re.sub(r"[^a-z0-9]", "", v.lower()) == re.sub(r"[^a-z0-9]", "", want.lower())
+                               for v in self.status_values):
+                        self.status_text.set(self.status_values[0])
+                elif m[0] == "cmd_done":
+                    if self.is_running():
+                        self._set_compliance_buttons(not self.pause_btn.cget("state") == "normal" or self.adding_done)
+                        self.status.configure(text="Done - check the page in the browser" if m[1] == "compliance"
+                                              else self.status.cget("text"), text_color=GREEN if m[1] == "compliance" else MUTED)
+                elif m[0] == "paused":
+                    if m[1]:
+                        self.status.configure(text="Paused - click Resume to continue", text_color=AMBER)
+                    else:
+                        self.status.configure(text="Adding farmers...", text_color=MUTED)
+                elif m[0] == "progress":
+                    _, n, total, c = m
+                    self.prog.set(n / max(total, 1))
+                    self.status.configure(
+                        text=f"{n}/{total}   added {c['added']}  |  skipped {c['skipped']}  |  failed {c['failed']}",
+                        text_color=MUTED)
+                elif m[0] == "added_all":
+                    self._added_all(*m[1:])
+                elif m[0] == "done":
+                    self._finished(*m[1:])
+        except queue.Empty:
+            pass
+        self.after(100, self._poll)
+
+    def _added_all(self, counts, stopped, xlsx):
+        self.adding_done = True
+        self.pause_event.clear()
+        self.pause_btn.configure(text="❚❚  Pause", state="disabled")
+        self.stop_btn.configure(state="normal", text="■  Close browser")
+        self._set_compliance_buttons(True)
+        self._write("=== " + ("Stopped" if stopped else "Finished adding") + " ===", "head")
+        self._write(f"  Added: {counts['added']}", "ok")
+        self._write(f"  Skipped (no rule / not in list): {counts['skipped']}", "warn" if counts["skipped"] else "info")
+        self._write(f"  Failed: {counts['failed']}", "err" if counts["failed"] else "info")
+        self._write("  The browser is still open. Check the list there, click Save & Next yourself, then use "
+                    "\"Fill compliance page\" on the next page. Use \"Close browser\" when you are done.", "head")
+        self.status.configure(text="Done - check the list in the browser, then Save & Next", text_color=GREEN)
+        ask(self.app, "Stopped" if stopped else "Finished adding",
+            f"Added: {counts['added']}\nSkipped: {counts['skipped']}\nFailed: {counts['failed']}\n\n"
+            "The browser is still open on the Add Peers Appraisal page. Check the farmers list, fix anything "
+            "marked Skipped or Failed by hand, then click Save & Next yourself. On the next page, click "
+            "\"Fill compliance page\" here.\n\n"
+            "A list of every farmer (Excel) is in the results folder.", tone="ok")
+
+    def _finished(self, counts, stopped, error):
+        self.adding_done = False
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled", text="■  Stop")
+        self.pause_event.clear()
+        self.pause_btn.configure(text="❚❚  Pause", state="disabled")
+        self._set_compliance_buttons(False)
+        self.login_btn.configure(state="disabled", fg_color=BTN_BG, hover_color="#1f1f26", border_width=1,
+                                 text_color=TEXT)
+        if error:
+            self._write(f"STOPPED WITH ERROR: {error}", "err")
+            self.status.configure(text="Stopped - see log.", text_color=RED)
+            ask(self.app, "The run stopped", error, tone="error")
+            return
+        self._write("Browser closed.", "info")
+        self.status.configure(text="Ready.", text_color=MUTED)
+
+    # ── settings ──
+    def _save_ui_settings(self):
+        save_settings(ui_peer={
+            "category": self.category.get(), "crop": self.crop.get(),
+            "rules": [[v.get() for v in row] for row in self.rules],
+            "specials": self.special_box.get("1.0", "end").strip(),
+            "start_at": self.start_at.get(), "max_count": self.max_count.get(), "test_mode": self.test_mode.get(),
+            "slow_mo": self.slow_mo.get(), "out": self.out_dir.get(),
+            "comply": self.comply.get(), "status_text": self.status_text.get(), "status_values": self.status_values,
+        })
+
+    def _load_ui_settings(self):
+        d = load_settings().get("ui_peer", {})
+        if not d:
+            return
+        self.category.set(d.get("category", "CEREALS"))
+        self.crop.set(d.get("crop", "PADDY (DHAN)"))
+        for row, saved in zip(self.rules, d.get("rules", [])):
+            for var, val in zip(row, saved):
+                var.set(val)
+        self.special_box.delete("1.0", "end")
+        self.special_box.insert("1.0", d.get("specials", ""))
+        self.start_at.set(d.get("start_at", "1"))
+        self.max_count.set(d.get("max_count", ""))
+        self.test_mode.set(d.get("test_mode", False))
+        self.slow_mo.set(d.get("slow_mo", "100"))
+        self.out_dir.set(d.get("out", str(default_output_dir())))
+        self.comply.set(d.get("comply", "Yes"))
+        self.status_values = list(d.get("status_values") or ["PGS GREEN 2"])
+        self.status_combo.configure(values=self.status_values)
+        self.status_text.set(d.get("status_text", "PGS GREEN 2"))
+
+
+# ───────────────────────────── application window ─────────────────────────────
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE)
+        self.configure(fg_color=BG)
+        scale = 1.0
+        try:
+            scale = self._get_window_scaling()
+        except Exception:
+            pass
+        sw, sh = self.winfo_screenwidth() / scale, self.winfo_screenheight() / scale
+        w, h = int(min(1080, sw - 40)), int(min(960, sh - 70))
+        self.geometry(f"{w}x{h}+{int(max(0, (sw - w) / 2 * scale))}+{int(max(0, (sh - h) / 3 * scale))}")
+        self.minsize(900, 680)
+        self._factories = {"launcher": LauncherScreen, "install": InstallScreen, "main": MainScreen}
+        self.screens = {}
+        self.current = None
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(300, self._set_icon)
+        self.show("launcher")
+
+    def _set_icon(self):
+        try:
+            if sys.platform == "win32":
+                p = data_dir() / "app.ico"
+                p.write_bytes(base64.b64decode(A.APP_ICO))
+                self.iconbitmap(str(p))
+            else:
+                self._icon_img = tk.PhotoImage(data=A.APP_ICON_PNG)
+                self.iconphoto(True, self._icon_img)
+        except Exception:
+            pass
+
+    def show(self, name):
+        if self.current:
+            self.screens[self.current].pack_forget()
+        if name not in self.screens:
+            self.screens[name] = self._factories[name](self)
+        self.current = name
+        screen = self.screens[name]
+        screen.pack(fill="both", expand=True)
+        if hasattr(screen, "on_show"):
+            screen.on_show()
+
+    def _on_close(self):
+        main = self.screens.get("main")
+        if main is not None:
+            if main.is_running():
+                if ask(self, "Run in progress", "A run is in progress. Stop it and close the app?",
+                       ("Keep running", "Stop and close"), primary=0, tone="warn") != 1:
+                    return
+            main.shutdown()
+        self.destroy()
+
+
+if __name__ == "__main__":
+    if "--make-icon" in sys.argv:            # used by the build to give the exe its icon
+        Path("app.ico").write_bytes(base64.b64decode(A.APP_ICO))
+        print("app.ico written")
+    else:
+        App().mainloop()
