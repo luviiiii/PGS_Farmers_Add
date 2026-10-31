@@ -92,6 +92,11 @@ def mkey(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
 
 
+def fkey(text: str) -> str:
+    """Farmer key: like mkey, and also ignores the relation word (S/O, W/O, D/O, C/O) between name and father."""
+    return re.sub(r"\s+", " ", re.sub(r"\b[swdc] o\b", " ", mkey(text))).strip()
+
+
 def to_num(text):
     return float(str(text).replace(",", "").strip())
 
@@ -103,8 +108,8 @@ def fmt_num(x: float) -> str:
 @dataclass
 class Config:
     out_dir: str
-    category: str = "CEREALS"
-    crop: str = "PADDY (DHAN)"
+    category: str = ""          # "" / "Auto" = find the category that holds the crop
+    crop: str = ""              # "" / "Auto" = the crop named in the Excel sheet's header
     excel_file: str = ""        # appraisal workbook: one sheet per group, one row per farmer
     sheet: str = ""             # "" = pick the sheet whose group matches the portal page
     start_at: int = 1           # start at this farmer number of the dropdown list
@@ -117,6 +122,10 @@ class Config:
 
 class FatalError(Exception):
     """Stops the whole run (browser closed...)."""
+
+
+def is_auto(text) -> bool:
+    return norm(text) in ("", "auto", "automatic") or norm(text).startswith("auto ")
 
 
 def parse_specials(text: str):
@@ -143,7 +152,7 @@ def _sheet_group(rows):
     for r in rows[:15]:
         cells = [c for c in r if c not in (None, "")]
         for k, c in enumerate(cells):
-            if "local group name" in norm(c) and k + 1 < len(cells):
+            if "group name" in norm(c) and k + 1 < len(cells):
                 return re.sub(r"\s+", " ", str(cells[k + 1])).strip()
     return ""
 
@@ -162,35 +171,61 @@ def excel_sheets(path: str):
     return out, None
 
 
+def _is_header_like(row):
+    cells = [c for c in row if c not in (None, "")]
+    return bool(cells) and all(isinstance(c, str) for c in cells)
+
+
+def _crop_from_header(text: str) -> str:
+    """'(Orange) Organic Area (Ha)' -> 'ORANGE';  'Green Chilli Organic Area (Ha)' -> 'GREEN CHILLI'."""
+    t = re.sub(r"[()]", " ", str(text or ""))
+    t = re.split(r"organic|area", t, flags=re.I)[0]
+    return re.sub(r"\s+", " ", t).strip().upper()
+
+
 def read_specials_excel(path: str, sheet_index: int = 0):
     """Reads one sheet: a row per farmer with name (+ father / husband name), area, expected yield and self
-    consumption. 'Area sown' (or 'offered') is used both as the offered area to check and as the area shown.
-    Headers are recognised by their words; with no headers the first four columns are name, offered, expected,
-    self. Returns (lines, skipped_count, error)."""
+    (home) consumption. The headers may span two rows. 'Organic area' (else 'offered', 'area sown') is used both
+    as the offered area to check and as the area shown. Returns (lines, skipped_count, error, crop_from_header)."""
     try:
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     except Exception as e:
-        return None, 0, f"Could not open the Excel file: {e}"
+        return None, 0, f"Could not open the Excel file: {e}", ""
     ws = wb.worksheets[min(max(sheet_index, 0), len(wb.worksheets) - 1)]
     rows = [list(r) for r in ws.iter_rows(values_only=True)]
     wb.close()
-    cols, father, first = (0, 1, 2, 3), None, 0
-    for i, r in enumerate(rows[:20]):
-        cells = [norm(c) for c in r]
-        def find(*words, skip=()):
+    width = max((len(r) for r in rows), default=0)
+    cols, father, first, crop = (0, 1, 2, 3), None, 0, ""
+    for i, r in enumerate(rows[:25]):
+        merged = i + 1 < len(rows) and _is_header_like(r) and _is_header_like(rows[i + 1])
+        raw = [(str(r[c]) if c < len(r) and r[c] is not None else "") + " " +
+               (str(rows[i + 1][c]) if merged and c < len(rows[i + 1]) and rows[i + 1][c] is not None else "")
+               for c in range(width)]
+        cells = [norm(c) for c in raw]
+        def find(*words, skip=(), none_of=()):
             for j, c in enumerate(cells):
-                if c and j not in skip and any(w in c for w in words):
+                if c and j not in skip and any(w in c for w in words) and not any(x in c for x in none_of):
                     return j
             return None
         f = find("father", "husband")
         n = find("farmer name", "name of farmer", "farmer", "name", skip=() if f is None else (f,))
-        o = find("area sown", "offered", "area")
-        y = find("expected", "yield")
-        sc = find("self")
+        o = next((v for v in (find("organic area"), find("offered"), find("area sown"),
+                              find("area (ha)", "area (h)", "area in", none_of=("total", "land", "holding", "registered")))
+                  if v is not None), None)
+        if o is None:
+            o = next((j for j, c in enumerate(cells) if "organic" in c and "area" in c), None)
+        y = find("estimated", "expected", "yield")
+        sc = find("self", "home consumption", "consumption")
         if None not in (n, o, y, sc) and len({n, o, y, sc}) == 4:
-            cols, father, first = (n, o, y, sc), f, i + 1
+            cols, father, first = (n, o, y, sc), f, i + 1 + (1 if merged else 0)
+            low = str(rows[i + 1][o]) if merged and o < len(rows[i + 1]) and rows[i + 1][o] is not None else raw[o]
+            crop = _crop_from_header(low) if "area sown" not in cells[o] else ""
+            if not crop:                                   # crop named in the yield column instead: "... ORANGE"
+                yl = str(rows[i + 1][y]) if merged and y < len(rows[i + 1]) and rows[i + 1][y] is not None else ""
+                m = re.search(r"yield[^A-Za-z]*(?:in)?\s*\(?q\)?\s*(.*)$", yl, flags=re.I)
+                crop = re.sub(r"[()]", " ", m.group(1)).strip().upper() if m else ""
             break
-    lines, skipped = [], 0
+    lines, skipped, bad_run = [], 0, 0
     for r in rows[first:]:
         def cell(k):
             return r[k] if k is not None and k < len(r) else None
@@ -202,12 +237,17 @@ def read_specials_excel(path: str, sheet_index: int = 0):
             nums = [to_num(cell(c)) for c in cols[1:]]
         except (ValueError, TypeError):
             skipped += 1
+            bad_run += 1
+            if lines and bad_run >= 3:                # the farmer table is over (notes / checklists follow)
+                skipped -= bad_run
+                break
             continue
+        bad_run = 0
         lines.append(f"{name}{' S/O ' + dad if dad else ''}, " + ", ".join(fmt_num(round(x, 6)) for x in nums))
     if not lines:
         return None, skipped, ("No farmer rows found on that sheet. It needs the farmer name, area, expected yield "
-                               "and self consumption in each row.")
-    return lines, skipped, None
+                               "and self (home) consumption in each row."), crop
+    return lines, max(skipped, 0), None, crop
 
 
 def special_map(specials, options):
@@ -216,8 +256,8 @@ def special_map(specials, options):
     offered area matches what the portal shows."""
     chosen, clash, unmatched = {}, {}, []
     for line in specials:
-        key = mkey(line[0])
-        hits = [t for _, t in options if key == mkey(t)] or [t for _, t in options if key and key in mkey(t)]
+        key = fkey(line[0])
+        hits = [t for _, t in options if key == fkey(t)] or [t for _, t in options if key and key in fkey(t)]
         texts = set(hits)
         if not hits:
             unmatched.append(line[0])
@@ -314,6 +354,8 @@ class Runner:
         self.cmd_q = cmd_q                  # jobs for the compliance page: ("compliance", {...}) / ("status_options",)
         self.dialog_msgs = []
         self.special_for, self.special_clash, self.used_names = {}, {}, set()
+        self.sheet_crop = ""
+        self.auto_category = None
         self.rows = []
         self.csv_path = None
         self.xlsx_path = None
@@ -490,9 +532,10 @@ class Runner:
         else:
             raise FatalError("The group name could not be read from the page, so the sheet cannot be chosen "
                              "automatically. Choose the sheet in the app (Sheet box) and try again.")
-        lines, skipped, err = read_specials_excel(cfg.excel_file, idx)
+        lines, skipped, err, crop = read_specials_excel(cfg.excel_file, idx)
         if err:
             raise FatalError(f"Sheet '{sheets[idx][0].strip()}': {err}")
+        self.sheet_crop = crop
         specials, perr = parse_specials("\n".join(lines))
         if perr:
             raise FatalError(perr)
@@ -500,6 +543,28 @@ class Runner:
                  f"{len(specials)} farmer(s)" + (f", {skipped} row(s) without usable numbers left out" if skipped else "")
                  + (" - chosen because it matches the group on the page." if not cfg.sheet and on_page else "."), "ok")
         return specials
+
+    def auto_crop(self):
+        """The crop to add: the Crop box if filled in, else the crop named in the sheet's header."""
+        return self.cfg.crop.strip() if not is_auto(self.cfg.crop) else self.sheet_crop
+
+    async def find_category(self, f, crop_wanted):
+        """Try each crop category until the crop list of one of them holds the wanted crop."""
+        end = time.time() + 12
+        cats = []
+        while time.time() < end and not cats:
+            cats = [o for o in await self.read_options(f["category"]) if not norm(o[1]).startswith("--") and o[1]]
+            if not cats:
+                await asyncio.sleep(0.4)
+        tried = []
+        for c in cats:
+            await self.choose(f["category"], c)
+            await asyncio.sleep(0.9)
+            crop, _ = await self.wait_option(f["crop"], crop_wanted, timeout=3.0)
+            tried.append(c[1])
+            if crop:
+                return c, crop, tried
+        return None, None, tried
 
     async def wait_option(self, sel, wanted, timeout=12.0):
         """The options of Crop Category / Crop are loaded by the portal after the previous choice."""
@@ -554,21 +619,35 @@ class Runner:
         if farmer_opt is None:
             return ("Skipped",) + blank + ("not in the Farmer list any more (already added?)",)
 
+        crop_wanted = self.auto_crop()
+        if not crop_wanted:
+            return ("Failed",) + blank + ("no crop: the sheet has no crop in its header - type the crop in the "
+                                          "Crop box",)
         offered = None
         for attempt in (1, 2):
             await self.choose(f["farmer"], farmer_opt)
             await asyncio.sleep(0.9)                                  # portal loads the farmer's crop categories
-            cat, cat_opts = await self.wait_option(f["category"], cfg.category)
-            if not cat:
-                names = ", ".join(t for _, t in cat_opts if not norm(t).startswith("--")) or "none"
-                return ("Failed",) + blank + (f"crop category {cfg.category!r} is not available for this farmer "
-                                              f"(available: {names})",)
-            await self.choose(f["category"], cat)
-            await asyncio.sleep(0.9)                                  # portal loads the crops
-            crop, crop_opts = await self.wait_option(f["crop"], cfg.crop)
-            if not crop:
-                names = ", ".join(t for _, t in crop_opts if not norm(t).startswith("--")) or "none"
-                return ("Failed",) + blank + (f"crop {cfg.crop!r} is not available (available: {names})",)
+            cat_name = cfg.category.strip() if not is_auto(cfg.category) else self.auto_category
+            if cat_name:
+                cat, cat_opts = await self.wait_option(f["category"], cat_name)
+                if not cat:
+                    names = ", ".join(t for _, t in cat_opts if not norm(t).startswith("--")) or "none"
+                    return ("Failed",) + blank + (f"crop category {cat_name!r} is not available for this farmer "
+                                                  f"(available: {names})",)
+                await self.choose(f["category"], cat)
+                await asyncio.sleep(0.9)                              # portal loads the crops
+                crop, crop_opts = await self.wait_option(f["crop"], crop_wanted)
+                if not crop:
+                    names = ", ".join(t for _, t in crop_opts if not norm(t).startswith("--")) or "none"
+                    return ("Failed",) + blank + (f"crop {crop_wanted!r} is not available in {cat[1]} "
+                                                  f"(available: {names})",)
+            else:                                                     # find the category that holds this crop
+                cat, crop, tried = await self.find_category(f, crop_wanted)
+                if not crop:
+                    return ("Failed",) + blank + (f"crop {crop_wanted!r} was not found in any crop category "
+                                                  f"(tried: {', '.join(tried) or 'none'})",)
+                self.auto_category = cat[1]
+                self.log(f"   crop category found automatically: {cat[1]} / {crop[1]}", "ok")
             await self.choose(f["crop"], crop)
             raw = await self.stable_value(f["offered"])
             ok_sel = (norm(await self.selected_text(f["farmer"])) == norm(farmer_opt[1])
@@ -1609,8 +1688,8 @@ class MainScreen(ctk.CTkFrame):
         self.comply = tk.StringVar(value="Yes")
         self.status_text = tk.StringVar(value="PGS GREEN 2")
         self.status_values = ["PGS GREEN 2"]
-        self.category = tk.StringVar(value="CEREALS")
-        self.crop = tk.StringVar(value="PADDY (DHAN)")
+        self.category = tk.StringVar(value="")
+        self.crop = tk.StringVar(value="")
         self.excel = tk.StringVar()
         self.sheet_choice = tk.StringVar(value=AUTO_SHEET)
         self.sheet_names = {}                      # text shown in the Sheet box -> real sheet name
@@ -1658,9 +1737,11 @@ class MainScreen(ctk.CTkFrame):
         row = ctk.CTkFrame(b, fg_color="transparent")
         row.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         label(row, "Crop category:", 12, SOFT).pack(side="left")
-        entry(row, self.category, width=150).pack(side="left", padx=(8, 30))
+        entry(row, self.category, width=170, placeholder_text="Auto").pack(side="left", padx=(8, 30))
         label(row, "Crop:", 12, SOFT).pack(side="left")
-        entry(row, self.crop, width=190).pack(side="left", padx=(8, 0))
+        entry(row, self.crop, width=190, placeholder_text="Auto (from the sheet)").pack(side="left", padx=(8, 12))
+        label(row, "leave both empty: the crop comes from each sheet (Orange, Ginger...) and its category is found "
+                   "by the tool", 11, MUTED).pack(side="left")
         label(b, "Every farmer in the portal's dropdown is filled from the sheet. A farmer who is not in the sheet, or "
                  "whose area does not match, is skipped and listed - nothing is guessed.", 11, MUTED, anchor="w",
               wraplength=900, justify="left").grid(row=3, column=0, sticky="w", pady=(8, 0))
@@ -1764,7 +1845,8 @@ class MainScreen(ctk.CTkFrame):
                 shown = f"{n.strip()}   -   {grp}" if grp else n.strip()
                 self.sheet_names[shown] = n
                 values.append(shown)
-            if announce:
+            if announce and getattr(self, "_announced", None) != (p, len(sheets)):
+                self._announced = (p, len(sheets))
                 self._write(f"Excel opened: {len(sheets)} sheet(s) - " + "; ".join(
                     f"{n.strip()} ({grp or 'no group name'})" for n, grp in sheets), "ok")
         self.sheet_combo.configure(values=values)
@@ -1790,8 +1872,6 @@ class MainScreen(ctk.CTkFrame):
 
     def _config(self):
         category, crop = self.category.get().strip(), self.crop.get().strip()
-        if not category or not crop:
-            return self._bad("Please fill in the crop category and the crop.")
         excel = self.excel.get().strip().strip('"')
         if not excel or not Path(excel).is_file():
             return self._bad("Please choose the Excel file with the farmers.")
@@ -1801,9 +1881,10 @@ class MainScreen(ctk.CTkFrame):
         sheet = self.sheet_names.get(self.sheet_choice.get(), "")
         if sheet and sheet not in [n for n, _ in sheets]:
             return self._bad("That sheet is no longer in the Excel file. Choose the sheet again.")
-        lines, _, err = read_specials_excel(excel, [n for n, _ in sheets].index(sheet) if sheet else 0)
-        if err and sheet:
-            return self._bad(err)
+        if sheet:
+            lines, _, err, _crop = read_specials_excel(excel, [n for n, _ in sheets].index(sheet))
+            if err:
+                return self._bad(err)
         try:
             start = int(self.start_at.get())
             if start < 1:
@@ -1835,7 +1916,8 @@ class MainScreen(ctk.CTkFrame):
         who = ("the FIRST farmer only (test mode - ADD is not pressed)" if cfg.test_mode else
                "every farmer in the dropdown" if not cfg.max_count else f"{cfg.max_count} farmer(s)")
         if ask(self.app, "Open the browser?",
-               f"The tool will add {who} with  {cfg.category} / {cfg.crop}.\n\nArea, expected yield and self "
+               f"The tool will add {who} - crop: "
+               f"{(cfg.crop or 'from the sheet')}{(' / ' + cfg.category) if cfg.category else ''}.\n\nArea, expected yield and self "
                f"consumption come from  {Path(cfg.excel_file).name}  "
                f"({'sheet ' + cfg.sheet.strip() if cfg.sheet else 'the sheet of the group you have open'}).\n\n"
                "It opens a browser. You log in, open Add Peers Appraisal and fill in the top part and the dates "
@@ -2027,8 +2109,8 @@ class MainScreen(ctk.CTkFrame):
         d = load_settings().get("ui_peer", {})
         if not d:
             return
-        self.category.set(d.get("category", "CEREALS"))
-        self.crop.set(d.get("crop", "PADDY (DHAN)"))
+        self.category.set(d.get("category", ""))
+        self.crop.set(d.get("crop", ""))
         self.excel.set(d.get("excel", ""))
         if self.excel.get() and Path(self.excel.get()).is_file():
             self._refresh_sheets(keep=d.get("sheet", ""))
