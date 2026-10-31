@@ -105,11 +105,8 @@ class Config:
     out_dir: str
     category: str = "CEREALS"
     crop: str = "PADDY (DHAN)"
-    # (offered for organic, area shown, expected yield, self consumption) - all in the portal's units
-    rules: tuple = (("2", "2", "6", "5"), ("1", "1", "3", "3"))
-    # farmers with their own numbers: (part of the farmer's name, offered, expected yield, self consumption)
-    specials: tuple = ()
-    expect_group: str = ""      # group name the Excel sheet is for (checked against the portal page)
+    excel_file: str = ""        # appraisal workbook: one sheet per group, one row per farmer
+    sheet: str = ""             # "" = pick the sheet whose group matches the portal page
     start_at: int = 1           # start at this farmer number of the dropdown list
     max_count: int = 0          # 0 = all farmers
     test_mode: bool = False     # fill the first farmer but do NOT press ADD
@@ -120,16 +117,6 @@ class Config:
 
 class FatalError(Exception):
     """Stops the whole run (browser closed...)."""
-
-
-def find_rule(cfg: Config, offered: float):
-    for r in cfg.rules:
-        try:
-            if abs(to_num(r[0]) - offered) < 1e-6:
-                return r
-        except ValueError:
-            continue
-    return None
 
 
 def parse_specials(text: str):
@@ -221,15 +208,6 @@ def read_specials_excel(path: str, sheet_index: int = 0):
         return None, skipped, ("No farmer rows found on that sheet. It needs the farmer name, area, expected yield "
                                "and self consumption in each row.")
     return lines, skipped, None
-
-
-def parse_group_comment(text: str) -> str:
-    """The '# group: <name>' line that 'Load from Excel' writes at the top of the farmers box."""
-    for line in str(text or "").splitlines():
-        m = re.match(r"^\s*#\s*group\s*:\s*(.*?)\s*(?:\(sheet:.*\))?\s*$", line, re.I)
-        if m:
-            return m.group(1).strip()
-    return ""
 
 
 def special_map(specials, options):
@@ -335,7 +313,7 @@ class Runner:
         self.close_event = close_event      # set = close the browser when the farmers are done
         self.cmd_q = cmd_q                  # jobs for the compliance page: ("compliance", {...}) / ("status_options",)
         self.dialog_msgs = []
-        self.special_for, self.special_clash = {}, {}
+        self.special_for, self.special_clash, self.used_names = {}, {}, set()
         self.rows = []
         self.csv_path = None
         self.xlsx_path = None
@@ -481,22 +459,47 @@ class Runner:
         return '';
     }"""
 
-    async def check_group(self, page, expected):
-        """The Excel sheet must belong to the group whose appraisal is open."""
+    async def load_excel(self, page):
+        """Reads the Excel sheet that belongs to the group open on the portal. Returns the farmer lines."""
+        cfg = self.cfg
+        sheets, err = excel_sheets(cfg.excel_file)
+        if err:
+            raise FatalError(err)
         try:
             on_page = (await page.evaluate(self._JS_LEADER)).strip()
         except Exception:
             on_page = ""
-        if not on_page:
-            self.log("   (could not read the group name from the page, so the Excel sheet could not be checked "
-                     "against it)", "warn")
-            return
-        if mkey(expected) == mkey(on_page):
-            self.log(f"Excel sheet matches this group: {on_page}", "ok")
-            return
-        raise FatalError(f"The Excel sheet you loaded is for the group\n   {expected}\nbut the open appraisal is "
-                         f"for\n   {on_page}\nLoad the sheet of this group. (If it is the right sheet and only the "
-                         "spelling differs, edit or delete the '# group:' line at the top of the farmers box.)")
+        names = [n for n, _ in sheets]
+        listing = "\n".join(f"   {n.strip()}  -  {g or '(no group name on the sheet)'}" for n, g in sheets)
+        if cfg.sheet:
+            idx = names.index(cfg.sheet) if cfg.sheet in names else None
+            if idx is None:
+                raise FatalError(f"The sheet '{cfg.sheet}' is not in the Excel file any more. Sheets found:\n{listing}")
+            group = sheets[idx][1]
+            if on_page and group and mkey(group) != mkey(on_page):
+                raise FatalError(f"The sheet you chose is for the group\n   {group}\nbut the open appraisal is for"
+                                 f"\n   {on_page}\nChoose the sheet of this group (or leave it on Auto).")
+        elif on_page:
+            hit = [i for i, (_, g) in enumerate(sheets) if g and mkey(g) == mkey(on_page)]
+            if len(hit) != 1:
+                raise FatalError((f"No sheet in the Excel file is for the open group\n   {on_page}\nSheets found:\n{listing}"
+                                  if not hit else f"Several sheets are for the group\n   {on_page}\nChoose one in the app.\n{listing}"))
+            idx = hit[0]
+        elif len(sheets) == 1:
+            idx = 0
+        else:
+            raise FatalError("The group name could not be read from the page, so the sheet cannot be chosen "
+                             "automatically. Choose the sheet in the app (Sheet box) and try again.")
+        lines, skipped, err = read_specials_excel(cfg.excel_file, idx)
+        if err:
+            raise FatalError(f"Sheet '{sheets[idx][0].strip()}': {err}")
+        specials, perr = parse_specials("\n".join(lines))
+        if perr:
+            raise FatalError(perr)
+        self.log(f"Excel sheet '{sheets[idx][0].strip()}' ({sheets[idx][1] or 'group name not on the sheet'}): "
+                 f"{len(specials)} farmer(s)" + (f", {skipped} row(s) without usable numbers left out" if skipped else "")
+                 + (" - chosen because it matches the group on the page." if not cfg.sheet and on_page else "."), "ok")
+        return specials
 
     async def wait_option(self, sel, wanted, timeout=12.0):
         """The options of Crop Category / Crop are loaded by the portal after the previous choice."""
@@ -590,24 +593,23 @@ class Runner:
         if text in self.special_clash:
             return ("Skipped", shown, "", "", "", self.special_clash[text])
         lines = self.special_for.get(text)
-        if lines:
-            cands = [l for l in lines if abs(to_num(l[1]) - offered) <= 1e-6]
-            if not cands:
-                said = " / ".join(sorted({l[1] for l in lines}))
-                return ("Skipped", shown, "", "", "", f"the Excel / special line says {said} ha but the portal shows "
-                                                      f"{shown} ha - fill this farmer by hand")
-            if len({(l[2], l[3]) for l in cands}) > 1:
-                return ("Skipped", shown, "", "", "", "several lines with this name and area have different "
-                                                      "numbers - fill this farmer by hand")
-            sp = cands[0]
-            lines.remove(sp)                      # a second farmer with the same name takes the next line
-            area, yld, own = shown, sp[2], sp[3]
-            note = "special numbers"
-        else:
-            rule = find_rule(cfg, offered)
-            if rule is None:
-                return ("Skipped", shown, "", "", "", f"no rule for offered area {shown} ha - fill this farmer by hand")
-            _, area, yld, own = rule
+        if not lines:
+            why = ("all the Excel lines for this name were already used" if text in self.used_names
+                   else "this farmer is not in the Excel sheet")
+            return ("Skipped", shown, "", "", "", why + " - fill this farmer by hand")
+        cands = [l for l in lines if abs(to_num(l[1]) - offered) <= 1e-6]
+        if not cands:
+            said = " / ".join(sorted({l[1] for l in lines}))
+            return ("Skipped", shown, "", "", "", f"the Excel says area {said} ha but the portal shows offered "
+                                                  f"{shown} ha - fill this farmer by hand")
+        if len({(l[2], l[3]) for l in cands}) > 1:
+            return ("Skipped", shown, "", "", "", "several Excel rows with this name and area have different "
+                                                  "numbers - fill this farmer by hand")
+        sp = cands[0]
+        lines.remove(sp)                      # a second farmer with the same name takes the next row
+        self.used_names.add(text)
+        area, yld, own = shown, sp[2], sp[3]
+        note = "from Excel"
         for key, val in (("area", area), ("yield", yld), ("self", own)):
             await f[key].fill(val, timeout=ACTION_TIMEOUT)
         got = [(await f[k].input_value()).strip() for k in ("area", "yield", "self")]
@@ -863,24 +865,24 @@ class Runner:
                                      "\"Ready - add farmers\" again.", "err")
                             self.log(f"   (page details saved in {dump})", "warn")
                     await page.bring_to_front()
-                    if cfg.expect_group:
-                        await self.check_group(page, cfg.expect_group)
+                    specials = await self.load_excel(page)
 
                     options = [o for o in await self.read_options(f["farmer"])
                                if not norm(o[1]).startswith("--") and norm(o[1]) not in ("", "select")]
                     if not options:
                         raise FatalError("The Farmer dropdown is empty. Make sure the Season/Month/Year at the top "
                                          "are filled in, then try again.")
-                    if cfg.specials:
-                        self.special_for, self.special_clash, unmatched = special_map(cfg.specials, options)
-                        covered = sum(1 for _, t in options if t in self.special_for)
-                        others = len(options) - covered - len(self.special_clash)
-                        self.log(f"Excel / special numbers found for {covered} farmer(s); {others} other farmer(s) in "
-                                 "the dropdown use the rules table.", "head")
-                        for name in unmatched:
-                            self.log(f"   no farmer in the dropdown matches the special line '{name}'", "warn")
-                        for t, why in self.special_clash.items():
-                            self.log(f"   {t}: {why}", "warn")
+                    self.special_for, self.special_clash, unmatched = special_map(specials, options)
+                    covered = sum(1 for _, t in options if t in self.special_for)
+                    missing = len(options) - covered - len(self.special_clash)
+                    self.log(f"Excel numbers found for {covered} of the {len(options)} farmers in the dropdown"
+                             + (f"; {missing} not in the Excel will be skipped" if missing else "") + ".", "head")
+                    for name in unmatched[:8]:
+                        self.log(f"   Excel farmer not in the dropdown: {name}", "warn")
+                    if len(unmatched) > 8:
+                        self.log(f"   ... and {len(unmatched) - 8} more Excel farmers not in the dropdown", "warn")
+                    for t, why in self.special_clash.items():
+                        self.log(f"   {t}: {why}", "warn")
                     start = max(1, cfg.start_at)
                     todo = list(enumerate(options, start=1))[start - 1:]
                     if cfg.max_count:
@@ -937,12 +939,12 @@ class Runner:
                         counts[key] += 1
                         self.emit(("progress", n, total, dict(counts)))
 
-                    if (cfg.specials and not stopped and not cfg.test_mode and not cfg.max_count
+                    if (self.special_for and not stopped and not cfg.test_mode and not cfg.max_count
                             and cfg.start_at <= 1):
                         for t, ls in self.special_for.items():
                             for l in ls:
-                                self.log(f"   Excel line not used (portal offered area did not match, or the farmer "
-                                         f"was not added): {l[0]}", "warn")
+                                self.log(f"   Excel row not used (area did not match the portal, or the farmer was not added): "
+                                         f"{l[0]}", "warn")
                     try:
                         if write_excel(self.xlsx_path, self.rows):
                             self.log(f"Excel file saved: {self.xlsx_path}", "ok")
@@ -1588,34 +1590,7 @@ def checkbox(parent, text, var):
                            checkmark_color="#0b0b0d", text_color=TEXT, font=F(12))
 
 
-def pick_sheet(parent, sheets):
-    """Small modal window: choose which sheet (group) of the workbook to load. Returns the index or None."""
-    win = ctk.CTkToplevel(parent)
-    win.title("Which sheet?")
-    win.configure(fg_color=BG)
-    win.geometry("640x230")
-    win.transient(parent)
-    result = {"i": None}
-    names = [f"{n.strip()}   -   {g}" if g else n.strip() for n, g in sheets]
-    var = tk.StringVar(value=names[0])
-    label(win, "This Excel has one sheet per group. Choose the group you are working on:", 13, TEXT).pack(
-        padx=24, pady=(22, 10), anchor="w")
-    combo(win, var, names, 590).pack(padx=24, anchor="w")
-    bar = ctk.CTkFrame(win, fg_color="transparent")
-    bar.pack(side="bottom", fill="x", padx=24, pady=20)
-
-    def ok():
-        result["i"] = names.index(var.get()) if var.get() in names else 0
-        win.destroy()
-    button(bar, "Load this sheet", ok, primary=True, width=160).pack(side="right")
-    button(bar, "Cancel", win.destroy, width=110).pack(side="right", padx=10)
-    win.after(200, lambda: (win.lift(), win.focus_force()))
-    try:
-        win.grab_set()
-    except Exception:
-        pass
-    parent.wait_window(win)
-    return result["i"]
+AUTO_SHEET = "Auto - the sheet of the group open on the portal"
 
 
 class MainScreen(ctk.CTkFrame):
@@ -1636,8 +1611,9 @@ class MainScreen(ctk.CTkFrame):
         self.status_values = ["PGS GREEN 2"]
         self.category = tk.StringVar(value="CEREALS")
         self.crop = tk.StringVar(value="PADDY (DHAN)")
-        defaults = [("2", "2", "6", "5"), ("1", "1", "3", "3")] + [("", "", "", "")] * 3
-        self.rules = [[tk.StringVar(value=v) for v in row] for row in defaults]
+        self.excel = tk.StringVar()
+        self.sheet_choice = tk.StringVar(value=AUTO_SHEET)
+        self.sheet_names = {}                      # text shown in the Sheet box -> real sheet name
         self.start_at = tk.StringVar(value="1")
         self.max_count = tk.StringVar(value="")
         self.test_mode = tk.BooleanVar(value=False)
@@ -1664,39 +1640,30 @@ class MainScreen(ctk.CTkFrame):
         body = ctk.CTkScrollableFrame(self, fg_color="transparent", corner_radius=0)
         body.pack(fill="both", expand=True, padx=(0, 4))
 
-        # 1 - what to enter
-        c1 = Card(body, 1, "What to enter for every farmer", "Crop and the numbers that go with each 'Offered for organic' value")
+        # 1 - excel
+        c1 = Card(body, 1, "Excel file", "Farmer, area, expected yield and self consumption are read from it")
         c1.pack(fill="x", padx=24, pady=4)
         b = c1.body
+        b.columnconfigure(0, weight=1)
+        top = ctk.CTkFrame(b, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(0, weight=1)
+        entry(top, self.excel, width=300).grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        button(top, "Browse...", self._browse_excel, width=110).grid(row=0, column=1)
         row = ctk.CTkFrame(b, fg_color="transparent")
-        row.pack(fill="x")
+        row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        label(row, "Sheet:", 12, SOFT).pack(side="left")
+        self.sheet_combo = combo(row, self.sheet_choice, [AUTO_SHEET], 470)
+        self.sheet_combo.pack(side="left", padx=(8, 0))
+        row = ctk.CTkFrame(b, fg_color="transparent")
+        row.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         label(row, "Crop category:", 12, SOFT).pack(side="left")
         entry(row, self.category, width=150).pack(side="left", padx=(8, 30))
         label(row, "Crop:", 12, SOFT).pack(side="left")
         entry(row, self.crop, width=190).pack(side="left", padx=(8, 0))
-        mid = ctk.CTkFrame(b, fg_color="transparent")
-        mid.pack(fill="x", pady=(10, 0))
-        grid = ctk.CTkFrame(mid, fg_color="transparent")
-        grid.pack(side="left", anchor="n")
-        for c, head in enumerate(("Offered (ha)", "Area (Ha)", "Exp. yield (qt)", "Self cons. (qt)")):
-            label(grid, head, 11, MUTED).grid(row=0, column=c, padx=(0, 10), sticky="w")
-        for r, vars_ in enumerate(self.rules, start=1):
-            for c, var in enumerate(vars_):
-                entry(grid, var, width=105).grid(row=r, column=c, padx=(0, 10), pady=(3, 0), sticky="w")
-        sp = ctk.CTkFrame(mid, fg_color="transparent")
-        sp.pack(side="left", fill="both", expand=True, padx=(18, 0))
-        top = ctk.CTkFrame(sp, fg_color="transparent")
-        top.pack(fill="x")
-        label(top, "Farmers with their own numbers:", 11, SOFT).pack(side="left")
-        button(top, "Load from Excel...", self._load_specials_excel, width=140).pack(side="right")
-        label(sp, "one per line - name, offered, expected yield, self consumption (or load an Excel)", 11, MUTED,
-              anchor="w").pack(fill="x")
-        self.special_box = ctk.CTkTextbox(sp, height=120, corner_radius=8, fg_color=FIELD, border_width=1,
-                                          border_color=FIELD_BORDER, text_color=TEXT, font=(MONO, 12), wrap="none")
-        self.special_box.pack(fill="both", expand=True, pady=(3, 0))
-        label(sp, "e.g.  HUSSAIN AHMED, 3, 5.5, 5.4   (area = offered)", 11, MUTED, anchor="w").pack(fill="x", pady=(3, 0))
-        label(b, "A farmer whose 'Offered for organic' matches none of these rows is skipped and listed in the "
-                 "result - nothing is guessed.", 11, MUTED, anchor="w").pack(fill="x", pady=(8, 0))
+        label(b, "Every farmer in the portal's dropdown is filled from the sheet. A farmer who is not in the sheet, or "
+                 "whose area does not match, is skipped and listed - nothing is guessed.", 11, MUTED, anchor="w",
+              wraplength=900, justify="left").grid(row=3, column=0, sticky="w", pady=(8, 0))
 
         # 2 - options
         c2 = Card(body, 2, "Options", "Which farmers, speed, and where the result is saved")
@@ -1775,28 +1742,34 @@ class MainScreen(ctk.CTkFrame):
         if p:
             self.out_dir.set(p)
 
-    def _load_specials_excel(self):
-        p = filedialog.askopenfilename(title="Excel with the farmers, area, expected yield and self consumption",
+    def _browse_excel(self):
+        p = filedialog.askopenfilename(title="Excel file with the farmers",
                                        filetypes=[("Excel files", "*.xlsx *.xlsm"), ("All files", "*.*")])
-        if not p:
-            return
-        sheets, err = excel_sheets(p)
-        if err:
-            return self._bad(err)
-        idx = 0
-        if len(sheets) > 1:
-            idx = pick_sheet(self.app, sheets)
-            if idx is None:
-                return
-        lines, skipped, err = read_specials_excel(p, idx)
-        if err:
-            return self._bad(err)
-        sheet, group = sheets[idx]
-        head = f"# group: {group or sheet}  (sheet: {sheet.strip()})\n"
-        self.special_box.delete("1.0", "end")
-        self.special_box.insert("1.0", head + "\n".join(lines))
-        self._write(f"Loaded {len(lines)} farmer(s) from sheet '{sheet.strip()}' of {Path(p).name}"
-                    + (f" ({skipped} row(s) without usable numbers were left out)" if skipped else "") + ".", "ok")
+        if p:
+            self.excel.set(p)
+            self._refresh_sheets(announce=True)
+
+    def _refresh_sheets(self, announce=False, keep=""):
+        """Fill the Sheet box from the chosen workbook (one sheet per group)."""
+        p = self.excel.get().strip().strip('"')
+        self.sheet_names = {}
+        values = [AUTO_SHEET]
+        if p and Path(p).is_file():
+            sheets, err = excel_sheets(p)
+            if err:
+                self.sheet_combo.configure(values=values)
+                self.sheet_choice.set(AUTO_SHEET)
+                return self._bad(err)
+            for n, grp in sheets:
+                shown = f"{n.strip()}   -   {grp}" if grp else n.strip()
+                self.sheet_names[shown] = n
+                values.append(shown)
+            if announce:
+                self._write(f"Excel opened: {len(sheets)} sheet(s) - " + "; ".join(
+                    f"{n.strip()} ({grp or 'no group name'})" for n, grp in sheets), "ok")
+        self.sheet_combo.configure(values=values)
+        pick = next((s for s, n in self.sheet_names.items() if n == keep), AUTO_SHEET) if keep else AUTO_SHEET
+        self.sheet_choice.set(pick)
 
     def _open_out(self):
         p = Path(self.out_dir.get().strip() or default_output_dir())
@@ -1819,27 +1792,17 @@ class MainScreen(ctk.CTkFrame):
         category, crop = self.category.get().strip(), self.crop.get().strip()
         if not category or not crop:
             return self._bad("Please fill in the crop category and the crop.")
-        rules = []
-        for i, vars_ in enumerate(self.rules, start=1):
-            vals = [v.get().strip() for v in vars_]
-            if not any(vals):
-                continue
-            if not all(vals):
-                return self._bad(f"Rule row {i} is only partly filled in. Fill all four boxes or clear the row.")
-            try:
-                nums = [to_num(v) for v in vals]
-            except ValueError:
-                return self._bad(f"Rule row {i}: all four boxes must be numbers.")
-            if any(n < 0 for n in nums):
-                return self._bad(f"Rule row {i}: numbers cannot be negative.")
-            if any(abs(to_num(r[0]) - nums[0]) < 1e-6 for r in rules):
-                return self._bad(f"Rule row {i}: the 'Offered for organic' value {vals[0]} is already used above.")
-            rules.append(tuple(vals))
-        if not rules:
-            return self._bad("Please enter at least one rule row.")
-        specials, err = parse_specials(self.special_box.get("1.0", "end"))
-        expect_group = parse_group_comment(self.special_box.get("1.0", "end"))
+        excel = self.excel.get().strip().strip('"')
+        if not excel or not Path(excel).is_file():
+            return self._bad("Please choose the Excel file with the farmers.")
+        sheets, err = excel_sheets(excel)
         if err:
+            return self._bad(err)
+        sheet = self.sheet_names.get(self.sheet_choice.get(), "")
+        if sheet and sheet not in [n for n, _ in sheets]:
+            return self._bad("That sheet is no longer in the Excel file. Choose the sheet again.")
+        lines, _, err = read_specials_excel(excel, [n for n, _ in sheets].index(sheet) if sheet else 0)
+        if err and sheet:
             return self._bad(err)
         try:
             start = int(self.start_at.get())
@@ -1861,7 +1824,7 @@ class MainScreen(ctk.CTkFrame):
         except ValueError:
             return self._bad("Delay must be a number of milliseconds.")
         return Config(out_dir=self.out_dir.get().strip() or str(default_output_dir()), category=category, crop=crop,
-                      rules=tuple(rules), specials=specials, expect_group=expect_group, start_at=start, max_count=mx, test_mode=self.test_mode.get(), slow_mo=slow,
+                      excel_file=excel, sheet=sheet, start_at=start, max_count=mx, test_mode=self.test_mode.get(), slow_mo=slow,
                       browser_channel=load_settings().get("browser_channel", ""))
 
     # ── actions ──
@@ -1869,15 +1832,12 @@ class MainScreen(ctk.CTkFrame):
         cfg = self._config()
         if not cfg:
             return
-        rules = "\n".join(f"   offered {r[0]} ha  ->  area {r[1]}, expected yield {r[2]}, self consumption {r[3]}"
-                          for r in cfg.rules)
-        if cfg.specials:
-            rules += "\n\nFarmers with their own numbers:\n" + "\n".join(
-                f"   {sp[0]}: offered {sp[1]} ha, expected yield {sp[2]}, self consumption {sp[3]}" for sp in cfg.specials)
         who = ("the FIRST farmer only (test mode - ADD is not pressed)" if cfg.test_mode else
                "every farmer in the dropdown" if not cfg.max_count else f"{cfg.max_count} farmer(s)")
         if ask(self.app, "Open the browser?",
-               f"The tool will add {who} with  {cfg.category} / {cfg.crop}  and these numbers:\n{rules}\n\n"
+               f"The tool will add {who} with  {cfg.category} / {cfg.crop}.\n\nArea, expected yield and self "
+               f"consumption come from  {Path(cfg.excel_file).name}  "
+               f"({'sheet ' + cfg.sheet.strip() if cfg.sheet else 'the sheet of the group you have open'}).\n\n"
                "It opens a browser. You log in, open Add Peers Appraisal and fill in the top part and the dates "
                "yourself, then click \"Ready - add farmers\" here.\n\n"
                "It never presses Save & Next - you do that yourself after checking the list.",
@@ -2024,7 +1984,7 @@ class MainScreen(ctk.CTkFrame):
         self._set_compliance_buttons(True)
         self._write("=== " + ("Stopped" if stopped else "Finished adding") + " ===", "head")
         self._write(f"  Added: {counts['added']}", "ok")
-        self._write(f"  Skipped (no rule / not in list): {counts['skipped']}", "warn" if counts["skipped"] else "info")
+        self._write(f"  Skipped (not in the Excel, or area differs): {counts['skipped']}", "warn" if counts["skipped"] else "info")
         self._write(f"  Failed: {counts['failed']}", "err" if counts["failed"] else "info")
         self._write("  The browser is still open. Check the list there, click Save & Next yourself, then use "
                     "\"Fill compliance page\" on the next page. Use \"Close browser\" when you are done.", "head")
@@ -2057,8 +2017,7 @@ class MainScreen(ctk.CTkFrame):
     def _save_ui_settings(self):
         save_settings(ui_peer={
             "category": self.category.get(), "crop": self.crop.get(),
-            "rules": [[v.get() for v in row] for row in self.rules],
-            "specials": self.special_box.get("1.0", "end").strip(),
+            "excel": self.excel.get(), "sheet": self.sheet_names.get(self.sheet_choice.get(), ""),
             "start_at": self.start_at.get(), "max_count": self.max_count.get(), "test_mode": self.test_mode.get(),
             "slow_mo": self.slow_mo.get(), "out": self.out_dir.get(),
             "comply": self.comply.get(), "status_text": self.status_text.get(), "status_values": self.status_values,
@@ -2070,11 +2029,9 @@ class MainScreen(ctk.CTkFrame):
             return
         self.category.set(d.get("category", "CEREALS"))
         self.crop.set(d.get("crop", "PADDY (DHAN)"))
-        for row, saved in zip(self.rules, d.get("rules", [])):
-            for var, val in zip(row, saved):
-                var.set(val)
-        self.special_box.delete("1.0", "end")
-        self.special_box.insert("1.0", d.get("specials", ""))
+        self.excel.set(d.get("excel", ""))
+        if self.excel.get() and Path(self.excel.get()).is_file():
+            self._refresh_sheets(keep=d.get("sheet", ""))
         self.start_at.set(d.get("start_at", "1"))
         self.max_count.set(d.get("max_count", ""))
         self.test_mode.set(d.get("test_mode", False))
