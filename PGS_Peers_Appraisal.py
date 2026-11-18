@@ -98,7 +98,14 @@ def fkey(text: str) -> str:
 
 
 def to_num(text):
-    return float(str(text).replace(",", "").strip())
+    """'2', '0.5', '1ha', '1 Ha', '28 Qt' -> number (a unit written after the number is ignored)."""
+    if isinstance(text, (int, float)):
+        return float(text)
+    t = str(text).replace(",", "").strip()
+    m = re.fullmatch(r"(\d+(?:\.\d+)?|\.\d+)\s*(?:hectares?|ha|h|quintals?|qtl|qt|q|kgs?)?\.?", t, flags=re.I)
+    if not m:
+        raise ValueError(t)
+    return float(m.group(1))
 
 
 def fmt_num(x: float) -> str:
@@ -112,6 +119,9 @@ class Config:
     crop: str = ""              # "" / "Auto" = the crop named in the Excel sheet's header
     excel_file: str = ""        # appraisal workbook: one sheet per group, one row per farmer
     sheet: str = ""             # "" = pick the sheet whose group matches the portal page
+    col_offered: str = ""       # heading of the offered / area column ("" = find it automatically)
+    col_yield: str = ""         # heading of the estimated yield column ("" = automatic)
+    col_home: str = ""          # heading of the home / self consumption column ("" = automatic)
     start_at: int = 1           # start at this farmer number of the dropdown list
     max_count: int = 0          # 0 = all farmers
     test_mode: bool = False     # fill the first farmer but do NOT press ADD
@@ -183,10 +193,91 @@ def _crop_from_header(text: str) -> str:
     return re.sub(r"\s+", " ", t).strip().upper()
 
 
-def read_specials_excel(path: str, sheet_index: int = 0):
+def _header_scan(rows, picks=("", "", "")):
+    """Finds the header rows. picks = headings chosen by the user for (offered/area, yield, home consumption);
+    "" = detect that column automatically. Returns a dict (cols, father, first, crop, labels, used_picks) or None."""
+    width = max((len(r) for r in rows), default=0)
+    for use in ((True, False) if any(picks) else (False,)):
+        for i, r in enumerate(rows[:25]):
+            merged = i + 1 < len(rows) and _is_header_like(r) and _is_header_like(rows[i + 1])
+            nxt = rows[i + 1] if merged else []
+            raw, low = [], []
+            for c in range(width):
+                up = str(r[c]) if c < len(r) and r[c] is not None else ""
+                lo = str(nxt[c]) if merged and c < len(nxt) and nxt[c] is not None else ""
+                raw.append(up + " " + lo)
+                low.append(lo.strip() or up.strip())
+            cells = [norm(c) for c in raw]
+            def find(*words, skip=(), none_of=()):
+                for j, c in enumerate(cells):
+                    if c and j not in skip and any(w in c for w in words) and not any(x in c for x in none_of):
+                        return j
+                return None
+            def by_label(label):
+                t = norm(label)
+                for j, c in enumerate(low):
+                    if t and norm(c) == t:
+                        return j
+                for j, c in enumerate(cells):
+                    if t and c and (c == t or c.endswith(" " + t)):
+                        return j
+                return None
+            f = find("father", "husband")
+            n = find("farmer name", "name of farmer", "farmer", "name", skip=() if f is None else (f,))
+            bad = ("total", "land", "holding", "registered")
+            if use and picks[0]:
+                o = by_label(picks[0])
+            else:
+                o = next((v for v in (find("organic area", none_of=("registered",)), find("offered"), find("area sown"),
+                                      find("area", none_of=bad)) if v is not None), None)
+            y = by_label(picks[1]) if use and picks[1] else find("estimated", "expected", "yield")
+            sc = by_label(picks[2]) if use and picks[2] else find("self", "home consumption", "consumption")
+            if None in (n, o, y, sc) or len({n, o, y, sc}) != 4:
+                continue
+            crop = _crop_from_header(low[o]) if "area sown" not in cells[o] else ""
+            if not crop:                                   # crop named in the yield column instead: "... ORANGE"
+                m = re.search(r"yield[^A-Za-z]*(?:in)?\s*\(?q\)?\s*(.*)$", low[y], flags=re.I)
+                crop = re.sub(r"[()]", " ", m.group(1)).strip().upper() if m else ""
+            labels = [(j, low[j]) for j in range(width) if low[j] and j not in (n, f)]
+            return dict(cols=(n, o, y, sc), father=f, first=i + 1 + (1 if merged else 0), crop=crop,
+                        labels=labels, used_picks=use)
+    return None
+
+
+def sheet_headers(path: str, sheet_index: int = 0):
+    """Column headings of one sheet, for the column boxes of the app: [(column number, heading)]."""
+    try:
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        ws = wb.worksheets[min(max(sheet_index, 0), len(wb.worksheets) - 1)]
+        rows = [list(r) for r in ws.iter_rows(min_row=1, max_row=30, values_only=True)]
+        wb.close()
+    except Exception:
+        return []
+    h = _header_scan(rows)
+    if h:
+        return h["labels"]
+    best, best_n = None, 3                                   # no automatic match: the row with most text cells
+    for i, r in enumerate(rows[:25]):
+        k = sum(1 for c in r if isinstance(c, str) and c.strip())
+        if k > best_n:
+            best, best_n = i, k
+    if best is None:
+        return []
+    r = rows[best]
+    nxt = rows[best + 1] if best + 1 < len(rows) and _is_header_like(rows[best + 1]) else []
+    out = []
+    for j in range(len(r)):
+        lo = str(nxt[j]).strip() if j < len(nxt) and nxt[j] is not None else ""
+        up = str(r[j]).strip() if r[j] is not None else ""
+        if lo or up:
+            out.append((j, lo or up))
+    return out
+
+
+def read_specials_excel(path: str, sheet_index: int = 0, picks=("", "", ""), notes=None):
     """Reads one sheet: a row per farmer with name (+ father / husband name), area, expected yield and self
-    (home) consumption. The headers may span two rows. 'Organic area' (else 'offered', 'area sown') is used both
-    as the offered area to check and as the area shown. Returns (lines, skipped_count, error, crop_from_header)."""
+    (home) consumption. The headers may span two rows. picks = headings of the area / yield / home consumption
+    columns chosen in the app ("" = automatic). Returns (lines, skipped_count, error, crop_from_header)."""
     try:
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     except Exception as e:
@@ -194,37 +285,13 @@ def read_specials_excel(path: str, sheet_index: int = 0):
     ws = wb.worksheets[min(max(sheet_index, 0), len(wb.worksheets) - 1)]
     rows = [list(r) for r in ws.iter_rows(values_only=True)]
     wb.close()
-    width = max((len(r) for r in rows), default=0)
-    cols, father, first, crop = (0, 1, 2, 3), None, 0, ""
-    for i, r in enumerate(rows[:25]):
-        merged = i + 1 < len(rows) and _is_header_like(r) and _is_header_like(rows[i + 1])
-        raw = [(str(r[c]) if c < len(r) and r[c] is not None else "") + " " +
-               (str(rows[i + 1][c]) if merged and c < len(rows[i + 1]) and rows[i + 1][c] is not None else "")
-               for c in range(width)]
-        cells = [norm(c) for c in raw]
-        def find(*words, skip=(), none_of=()):
-            for j, c in enumerate(cells):
-                if c and j not in skip and any(w in c for w in words) and not any(x in c for x in none_of):
-                    return j
-            return None
-        f = find("father", "husband")
-        n = find("farmer name", "name of farmer", "farmer", "name", skip=() if f is None else (f,))
-        o = next((v for v in (find("organic area"), find("offered"), find("area sown"),
-                              find("area (ha)", "area (h)", "area in", none_of=("total", "land", "holding", "registered")))
-                  if v is not None), None)
-        if o is None:
-            o = next((j for j, c in enumerate(cells) if "organic" in c and "area" in c), None)
-        y = find("estimated", "expected", "yield")
-        sc = find("self", "home consumption", "consumption")
-        if None not in (n, o, y, sc) and len({n, o, y, sc}) == 4:
-            cols, father, first = (n, o, y, sc), f, i + 1 + (1 if merged else 0)
-            low = str(rows[i + 1][o]) if merged and o < len(rows[i + 1]) and rows[i + 1][o] is not None else raw[o]
-            crop = _crop_from_header(low) if "area sown" not in cells[o] else ""
-            if not crop:                                   # crop named in the yield column instead: "... ORANGE"
-                yl = str(rows[i + 1][y]) if merged and y < len(rows[i + 1]) and rows[i + 1][y] is not None else ""
-                m = re.search(r"yield[^A-Za-z]*(?:in)?\s*\(?q\)?\s*(.*)$", yl, flags=re.I)
-                crop = re.sub(r"[()]", " ", m.group(1)).strip().upper() if m else ""
-            break
+    h = _header_scan(rows, tuple(picks))
+    if not h:
+        return None, 0, ("The column headings were not found on that sheet. It needs the farmer name, the area, the "
+                         "expected yield and the self (home) consumption - choose the columns in the app."), ""
+    if any(picks) and not h["used_picks"] and notes is not None:
+        notes.append("the column(s) you chose were not found on this sheet - used automatic detection instead")
+    cols, father, first, crop = h["cols"], h["father"], h["first"], h["crop"]
     lines, skipped, bad_run = [], 0, 0
     for r in rows[first:]:
         def cell(k):
@@ -501,7 +568,19 @@ class Runner:
         return '';
     }"""
 
-    async def load_excel(self, page):
+    def picks(self):
+        c = self.cfg
+        return tuple("" if is_auto(x) else x.strip() for x in (c.col_offered, c.col_yield, c.col_home))
+
+    def overlap(self, idx, option_keys):
+        """How many of the sheet's farmers are in the portal's Farmer dropdown (0..1 of the dropdown)."""
+        lines, _, err, _ = read_specials_excel(self.cfg.excel_file, idx, self.picks())
+        if err or not option_keys:
+            return 0.0
+        keys = {fkey(l.split(",")[0]) for l in lines}
+        return sum(1 for k in option_keys if k in keys) / len(option_keys)
+
+    async def load_excel(self, page, f=None):
         """Reads the Excel sheet that belongs to the group open on the portal. Returns the farmer lines."""
         cfg = self.cfg
         sheets, err = excel_sheets(cfg.excel_file)
@@ -512,17 +591,33 @@ class Runner:
         except Exception:
             on_page = ""
         names = [n for n, _ in sheets]
+        option_keys = []
+        if f is not None:
+            try:
+                option_keys = [fkey(t) for _, t in await self.read_options(f["farmer"])
+                               if not norm(t).startswith("--") and norm(t) not in ("", "select")]
+            except Exception:
+                option_keys = []
         listing = "\n".join(f"   {n.strip()}  -  {g or '(no group name on the sheet)'}" for n, g in sheets)
+        by_name = False
         if cfg.sheet:
             idx = names.index(cfg.sheet) if cfg.sheet in names else None
             if idx is None:
                 raise FatalError(f"The sheet '{cfg.sheet}' is not in the Excel file any more. Sheets found:\n{listing}")
             group = sheets[idx][1]
-            if on_page and group and mkey(group) != mkey(on_page):
+            if on_page and group and mkey(group) != mkey(on_page) and self.overlap(idx, option_keys) < 0.5:
                 raise FatalError(f"The sheet you chose is for the group\n   {group}\nbut the open appraisal is for"
                                  f"\n   {on_page}\nChoose the sheet of this group (or leave it on Auto).")
         elif on_page:
+            by_name = False
             hit = [i for i, (_, g) in enumerate(sheets) if g and mkey(g) == mkey(on_page)]
+            by_name = len(hit) == 1
+            if len(hit) != 1 and option_keys:           # names do not decide: use the farmers in the dropdown
+                scores = sorted(((self.overlap(i, option_keys), i) for i in (hit or range(len(sheets)))), reverse=True)
+                if scores and scores[0][0] >= 0.5 and (len(scores) == 1 or scores[0][0] > scores[1][0]):
+                    hit = [scores[0][1]]
+                    self.log(f"The group name did not decide the sheet; '{sheets[hit[0]][0].strip()}' was chosen "
+                             f"because {int(scores[0][0] * 100)}% of the portal's farmers are on it.", "warn")
             if len(hit) != 1:
                 raise FatalError((f"No sheet in the Excel file is for the open group\n   {on_page}\nSheets found:\n{listing}"
                                   if not hit else f"Several sheets are for the group\n   {on_page}\nChoose one in the app.\n{listing}"))
@@ -532,16 +627,19 @@ class Runner:
         else:
             raise FatalError("The group name could not be read from the page, so the sheet cannot be chosen "
                              "automatically. Choose the sheet in the app (Sheet box) and try again.")
-        lines, skipped, err, crop = read_specials_excel(cfg.excel_file, idx)
+        notes = []
+        lines, skipped, err, crop = read_specials_excel(cfg.excel_file, idx, self.picks(), notes)
         if err:
             raise FatalError(f"Sheet '{sheets[idx][0].strip()}': {err}")
+        for n_ in notes:
+            self.log(f"   Note: {n_}", "warn")
         self.sheet_crop = crop
         specials, perr = parse_specials("\n".join(lines))
         if perr:
             raise FatalError(perr)
         self.log(f"Excel sheet '{sheets[idx][0].strip()}' ({sheets[idx][1] or 'group name not on the sheet'}): "
                  f"{len(specials)} farmer(s)" + (f", {skipped} row(s) without usable numbers left out" if skipped else "")
-                 + (" - chosen because it matches the group on the page." if not cfg.sheet and on_page else "."), "ok")
+                 + (" - chosen because it matches the group on the page." if not cfg.sheet and on_page and by_name else "."), "ok")
         return specials
 
     def auto_crop(self):
@@ -944,7 +1042,7 @@ class Runner:
                                      "\"Ready - add farmers\" again.", "err")
                             self.log(f"   (page details saved in {dump})", "warn")
                     await page.bring_to_front()
-                    specials = await self.load_excel(page)
+                    specials = await self.load_excel(page, f)
 
                     options = [o for o in await self.read_options(f["farmer"])
                                if not norm(o[1]).startswith("--") and norm(o[1]) not in ("", "select")]
@@ -1670,6 +1768,7 @@ def checkbox(parent, text, var):
 
 
 AUTO_SHEET = "Auto - the sheet of the group open on the portal"
+AUTO_COL = "Auto"
 
 
 class MainScreen(ctk.CTkFrame):
@@ -1693,6 +1792,9 @@ class MainScreen(ctk.CTkFrame):
         self.excel = tk.StringVar()
         self.sheet_choice = tk.StringVar(value=AUTO_SHEET)
         self.sheet_names = {}                      # text shown in the Sheet box -> real sheet name
+        self.col_off = tk.StringVar(value=AUTO_COL)
+        self.col_yld = tk.StringVar(value=AUTO_COL)
+        self.col_home = tk.StringVar(value=AUTO_COL)
         self.start_at = tk.StringVar(value="1")
         self.max_count = tk.StringVar(value="")
         self.test_mode = tk.BooleanVar(value=False)
@@ -1734,6 +1836,7 @@ class MainScreen(ctk.CTkFrame):
         label(row, "Sheet:", 12, SOFT).pack(side="left")
         self.sheet_combo = combo(row, self.sheet_choice, [AUTO_SHEET], 470)
         self.sheet_combo.pack(side="left", padx=(8, 0))
+        self.sheet_choice.trace_add("write", lambda *_: self._refresh_columns())
         row = ctk.CTkFrame(b, fg_color="transparent")
         row.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         label(row, "Crop category:", 12, SOFT).pack(side="left")
@@ -1742,9 +1845,18 @@ class MainScreen(ctk.CTkFrame):
         entry(row, self.crop, width=190, placeholder_text="Auto (from the sheet)").pack(side="left", padx=(8, 12))
         label(row, "leave both empty: the crop comes from each sheet (Orange, Ginger...) and its category is found "
                    "by the tool", 11, MUTED).pack(side="left")
+        row = ctk.CTkFrame(b, fg_color="transparent")
+        row.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        self.col_combos = []
+        for text, var in (("Offered / area column:", self.col_off), ("Estimated yield column:", self.col_yld),
+                          ("Home consumption column:", self.col_home)):
+            label(row, text, 12, SOFT).pack(side="left")
+            cb = combo(row, var, [AUTO_COL], 150)
+            cb.pack(side="left", padx=(6, 16))
+            self.col_combos.append(cb)
         label(b, "Every farmer in the portal's dropdown is filled from the sheet. A farmer who is not in the sheet, or "
                  "whose area does not match, is skipped and listed - nothing is guessed.", 11, MUTED, anchor="w",
-              wraplength=900, justify="left").grid(row=3, column=0, sticky="w", pady=(8, 0))
+              wraplength=900, justify="left").grid(row=4, column=0, sticky="w", pady=(8, 0))
 
         # 2 - options
         c2 = Card(body, 2, "Options", "Which farmers, speed, and where the result is saved")
@@ -1853,6 +1965,27 @@ class MainScreen(ctk.CTkFrame):
         pick = next((s for s, n in self.sheet_names.items() if n == keep), AUTO_SHEET) if keep else AUTO_SHEET
         self.sheet_choice.set(pick)
 
+    def _refresh_columns(self):
+        """Fill the three column boxes with the headings of the chosen sheet (first sheet when on Auto)."""
+        try:
+            p = self.excel.get().strip().strip('"')
+            labels = []
+            if p and Path(p).is_file():
+                sheets, err = excel_sheets(p)
+                if sheets:
+                    name = self.sheet_names.get(self.sheet_choice.get(), "")
+                    idx = [n for n, _ in sheets].index(name) if name in [n for n, _ in sheets] else 0
+                    labels = sheet_headers(p, idx)
+            shown, seen = [], {}
+            for j, t in labels:
+                t = re.sub(r"\s+", " ", t).strip()
+                seen[t] = seen.get(t, 0) + 1
+                shown.append(t if seen[t] == 1 else f"{t} (column {j + 1})")
+            for cb in self.col_combos:
+                cb.configure(values=[AUTO_COL] + shown)
+        except Exception:
+            pass
+
     def _open_out(self):
         p = Path(self.out_dir.get().strip() or default_output_dir())
         try:
@@ -1879,10 +2012,11 @@ class MainScreen(ctk.CTkFrame):
         if err:
             return self._bad(err)
         sheet = self.sheet_names.get(self.sheet_choice.get(), "")
+        cols = ["" if is_auto(v.get()) else v.get().strip() for v in (self.col_off, self.col_yld, self.col_home)]
         if sheet and sheet not in [n for n, _ in sheets]:
             return self._bad("That sheet is no longer in the Excel file. Choose the sheet again.")
         if sheet:
-            lines, _, err, _crop = read_specials_excel(excel, [n for n, _ in sheets].index(sheet))
+            lines, _, err, _crop = read_specials_excel(excel, [n for n, _ in sheets].index(sheet), tuple(cols))
             if err:
                 return self._bad(err)
         try:
@@ -1905,7 +2039,7 @@ class MainScreen(ctk.CTkFrame):
         except ValueError:
             return self._bad("Delay must be a number of milliseconds.")
         return Config(out_dir=self.out_dir.get().strip() or str(default_output_dir()), category=category, crop=crop,
-                      excel_file=excel, sheet=sheet, start_at=start, max_count=mx, test_mode=self.test_mode.get(), slow_mo=slow,
+                      excel_file=excel, sheet=sheet, col_offered=cols[0], col_yield=cols[1], col_home=cols[2], start_at=start, max_count=mx, test_mode=self.test_mode.get(), slow_mo=slow,
                       browser_channel=load_settings().get("browser_channel", ""))
 
     # ── actions ──
@@ -2100,6 +2234,7 @@ class MainScreen(ctk.CTkFrame):
         save_settings(ui_peer={
             "category": self.category.get(), "crop": self.crop.get(),
             "excel": self.excel.get(), "sheet": self.sheet_names.get(self.sheet_choice.get(), ""),
+            "col_off": self.col_off.get(), "col_yld": self.col_yld.get(), "col_home": self.col_home.get(),
             "start_at": self.start_at.get(), "max_count": self.max_count.get(), "test_mode": self.test_mode.get(),
             "slow_mo": self.slow_mo.get(), "out": self.out_dir.get(),
             "comply": self.comply.get(), "status_text": self.status_text.get(), "status_values": self.status_values,
@@ -2114,6 +2249,9 @@ class MainScreen(ctk.CTkFrame):
         self.excel.set(d.get("excel", ""))
         if self.excel.get() and Path(self.excel.get()).is_file():
             self._refresh_sheets(keep=d.get("sheet", ""))
+        self.col_off.set(d.get("col_off", AUTO_COL) or AUTO_COL)
+        self.col_yld.set(d.get("col_yld", AUTO_COL) or AUTO_COL)
+        self.col_home.set(d.get("col_home", AUTO_COL) or AUTO_COL)
         self.start_at.set(d.get("start_at", "1"))
         self.max_count.set(d.get("max_count", ""))
         self.test_mode.set(d.get("test_mode", False))
